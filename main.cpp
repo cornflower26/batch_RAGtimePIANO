@@ -33,45 +33,14 @@ using namespace lbcrypto;
 namespace {
 
     void centroids() {
-        const uint32_t polyModulusDegree = 16384;
-        const std::string coeffCsv = "60,40,40,60";
-        const std::string securityLevel = "";
         const int paddedDim = 1024;
         const std::string inputVectorPath = "../query_768d_from_k4096_centroid0.txt";
 
-        int lanes = 8;
-        std::vector<int32_t> rotationIndices = RotationIndicesForLayout(lanes, paddedDim);
-        const auto coeffSizes = ParseUintCsv(coeffCsv);
-
-        CCParams<CryptoContextCKKSRNS> parameters;
-        parameters.SetMultiplicativeDepth(coeffSizes.size() > 2 ? coeffSizes.size() - 2 : 2);
-        parameters.SetScalingModSize(coeffSizes.size() > 1 ? coeffSizes[1] : 40);
-        parameters.SetBatchSize(polyModulusDegree / 2);
-        parameters.SetRingDim(polyModulusDegree);
-        if (securityLevel == "none" || securityLevel == "notset" ||
-            securityLevel == "HEStd_NotSet") {
-            parameters.SetSecurityLevel(HEStd_NotSet);
-        }
-
-        CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
-        cc->Enable(PKE);
-        cc->Enable(KEYSWITCH);
-        cc->Enable(LEVELEDSHE);
-        cc->Enable(ADVANCEDSHE);
-
-        KeyPair<DCRTPoly> keyPair = cc->KeyGen();
-        if (!keyPair.good()) {
-            throw std::runtime_error("Key generation failed");
-        }
-        cc->EvalMultKeyGen(keyPair.secretKey);
-        cc->EvalSumKeyGen(keyPair.secretKey);
-        if (!rotationIndices.empty()) {
-            cc->EvalRotateKeyGen(keyPair.secretKey, rotationIndices);
-        }
 
         const std::string outputDir = "test";
         std::filesystem::create_directories(outputDir);
-        PublicKey <DCRTPoly> pk = keyPair.publicKey;
+        PublicKey <DCRTPoly> pk = LoadPublicKey("test/public_key.bin");;
+        CryptoContext<DCRTPoly> cc = pk->GetCryptoContext();
         const int centroidsPerCiphertext = 8;
 
         const std::vector<double> query = ReadVectorFile(inputVectorPath);
@@ -187,7 +156,7 @@ namespace {
         std::cout << "Computed " << nCentroids << " centroid distances in "
                   << elapsedSec << " s.\n";
 
-        PrivateKey <DCRTPoly> sk = keyPair.secretKey;
+        PrivateKey <DCRTPoly> sk = LoadSecretKey("test/secret_key.bin");
 
         std::vector<std::pair<double, int>> scored;
         scored.reserve(nCentroids);
@@ -221,29 +190,75 @@ namespace {
 } //namespace
 
 int main(){
-    //run-centroid --context-dir DIR --input-vector query.txt --centroids-file centroids.txt --work-dir DIR [--output-json FILE]
-    //RunCentroidEndToEnd {{"--context-dir, "openfhe_core"},{"--input-vector","query.txt"},{"--centroids-file","centroids.txt"}}
-    //RunKeygen (context directory), RunEncryptCentroid (output dir)
-    //RunComputeCentroid (encrypted query, encrypted norm, output dir)
-    //RunDecryptCentroid (distance dir, output json file)
+    CliArgs args;
+    args.kv.push_back({"--context-dir", "test"});
+    args.kv.push_back({"--input-vector", "../query_768d_from_k4096_centroid0.txt"});
+    args.kv.push_back({"--centroids-file", "../centroids.txt"});
+    const std::string workDir = "test";
+    const std::string outputJson = "test/top_k_results.json";
     bool mac = false;
+    constexpr uint64_t DBsize = 6500;
+
+    constexpr uint64_t embedding_DBSize       = DBsize;
+    constexpr uint64_t embedding_DBEntrySize  = 768;
+    constexpr uint64_t embedding_DBEntryBytes = embedding_DBEntrySize * 8;
+    constexpr uint64_t embedding_BatchSize    = 32;
+    constexpr uint64_t embedding_FailProb     = 20;
+
+    constexpr uint64_t text_DBSize       = DBsize;
+    constexpr uint64_t text_DBEntrySize  = 1024;
+    constexpr uint64_t text_DBEntryBytes = text_DBEntrySize * 8;
+    constexpr uint64_t text_BatchSize    = 32;
+    constexpr uint64_t text_FailProb     = 20;
+
+    std::cout << "Loading embedding database ... " << std::endl;
+    std::vector<uint64_t> embedding_rawDB(embedding_DBEntrySize * embedding_DBSize);
+    std::vector<std::vector<uint64_t>> embedding_DB;
+    if (mac) embedding_DB = load_json_distances("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/faiss.json");
+    else embedding_DB = load_json_distances("/home/ajanusze/PIANO-RAG/faiss.json");
+    std::unordered_map<uint64_t, std::vector<uint64_t>> centroidToIndex;
+    std::cout << "Loading centroid mapping ... " << std::endl;
+    if (mac) centroidToIndex = load_json_mapping("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/65000_lists.json");
+    else centroidToIndex = load_json_mapping("/home/ajanusze/PIANO-RAG/prototype/data/65000_lists.json");
+
+    for (uint64_t i = 0; i < DBsize; ++i)
+        for (uint64_t j = 0; j < embedding_DB[i].size(); ++j) {
+            embedding_rawDB[i * embedding_DBEntrySize + j] = embedding_DB[i][j];
+        }
+
+    std::cout << "Loading text database ..." << std::endl;
+    std::vector<uint64_t> text_rawDB(text_DBEntrySize * text_DBSize);
+    std::vector<std::string> text_DB;
+    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index_1024.txt");
+    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index_1024.txt");
+    for (uint64_t i = 0; i < DBsize; ++i)
+        for (uint64_t j = 0; j < text_DB[i].size(); ++j)
+            text_rawDB[i * text_DBEntrySize + j] = int(text_DB[i][j]);
+
+
+    std::cout << "Server and Client One-time Setup" << std::endl;
+    auto pre_setup_time_start = std::chrono::steady_clock::now();
+    PianoPIR embedding_pir(embedding_DBSize, embedding_DBEntryBytes,embedding_rawDB, embedding_FailProb);
+    embedding_pir.Preprocessing();
+    PianoPIR pir(text_DBSize, text_DBEntryBytes, text_rawDB, text_FailProb);
+    pir.Preprocessing();
+    const uint64_t maxQueryNum = pir.client_MaxQueryNum();
+
+    std::cout << "Run KeyGen" << std::endl;
+    RunKeygen(args, "keygen-centroid");
+    CliArgs encArgs = args;
+    encArgs.kv.push_back({"--output-dir", workDir + "/encrypted_query"});
+    auto elapsed_pre_setup_time =
+            std::chrono::duration<double>(std::chrono::steady_clock::now()-pre_setup_time_start).count();
+    std::cout << "One-time Setup time " << elapsed_pre_setup_time << std::endl;
+
+
+    std::cout << "Setup time" << std::endl;
+    auto setup_time_start = std::chrono::steady_clock::now();
     if (mac){
         centroids();
     }
     else {
-        CliArgs args;
-        args.kv.push_back({"--context-dir", "test"});
-        args.kv.push_back({"--input-vector", "../query_768d_from_k4096_centroid0.txt"});
-        args.kv.push_back({"--centroids-file", "../centroids.txt"});
-        const std::string workDir = "test";
-        const std::string outputJson = "test/top_k_results.json";
-
-
-        std::cout << "Run KeyGen" << std::endl;
-        RunKeygen(args, "keygen-centroid");
-        CliArgs encArgs = args;
-        encArgs.kv.push_back({"--output-dir", workDir + "/encrypted_query"});
-
         std::cout << "Run EncryptCentroid" << std::endl;
         RunEncryptCentroid(encArgs);
         CliArgs compArgs = args;
@@ -260,72 +275,64 @@ int main(){
         std::cout << "Run DecryptCentroid" << std::endl;
         RunDecryptCentroid(decArgs);
     }
-
-    constexpr uint64_t embedding_DBSize       = 65000;
-    constexpr uint64_t embedding_DBEntrySize  = 768;
-    constexpr uint64_t embedding_DBEntryBytes = embedding_DBEntrySize * 8;
-    constexpr uint64_t embedding_BatchSize    = 32;
-    constexpr uint64_t embedding_FailProb     = 20;
-
-    std::cout << "Loading embedding database ... " << std::endl;
-    std::vector<uint64_t> embedding_rawDB(embedding_DBEntrySize * embedding_DBSize);
-    std::vector<std::vector<uint64_t>> embedding_DB;
-    if (mac) embedding_DB = load_json_distances("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/faiss.json");
-    else embedding_DB = load_json_distances("/home/ajanusze/PIANO-RAG/faiss.json");
+    auto elapsed_setup_time =
+            std::chrono::duration<double>(std::chrono::steady_clock::now()-setup_time_start).count();
+    std::cout << "Setup time " << elapsed_setup_time << std::endl;
 
 
-    //std::cout << std::endl;
-    for (uint64_t i = 0; i < embedding_DB.size(); ++i)
-        for (uint64_t j = 0; j < embedding_DB[i].size(); ++j) {
-            embedding_rawDB[i * embedding_DBEntrySize + j] = embedding_DB[i][j];
-            //std::cout << " " << int(embedding_DB[i][j]);
-        }
-    //std::cout << std::endl;
-
-
-    SimpleBatchPianoPIR embedding_pir(embedding_DBSize, embedding_DBEntryBytes, embedding_BatchSize,embedding_rawDB, embedding_FailProb);
-
-    embedding_pir.Preprocessing();
-
-
+    std::cout << "Query time start " << std::endl;
+    auto query_time_start = std::chrono::steady_clock::now();
     std::cout << "Loading centroid indices ... " << std::endl;
     std::vector<uint64_t> centroidIndices =
     //        load_centroid_indices("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/rag_operations/ground_truth.json");
     //        load_centroid_indices("/home/ajanusze/PIANO-RAG/decrypted_results/top_k_results.json");
             load_centroid_indices("test/top_k_results.json");
-    std::cout << "Loading centroid mapping ... " << std::endl;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> centroidToIndex;
-    if (mac) centroidToIndex = load_json_mapping("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/65000_lists.json");
-    else centroidToIndex = load_json_mapping("/home/ajanusze/PIANO-RAG/prototype/data/65000_lists.json");
-
     std::vector<uint64_t> unbatched_query = CentroidToIndex(centroidIndices,centroidToIndex);
     while (unbatched_query.size()%embedding_BatchSize != 0) unbatched_query.push_back(0);
     std::cout << "Queries to batch : ";
     for (int i = 0; i < unbatched_query.size(); i++)
         std::cout << unbatched_query[i] << " ";
+    std::cout << std::endl;
 
     std::cout << "Computing queries ... " << unbatched_query.size() << std::endl;
     std::vector<std::vector<float>> responses;
     std::vector<uint64_t> index_responses;
+    uint64_t ret_num = (maxQueryNum > unbatched_query.size()) ? unbatched_query.size() : pir.client_MaxQueryNum();
+    std::cout << "Processing queries ... " << ret_num << std::endl;
+    for (uint64_t i = 0; i < ret_num; ++i) {
+        uint64_t idx = unbatched_query[i];
+        std::vector<uint64_t> query;
+        query = embedding_pir.Query(idx, /*realQuery=*/true);
+        std::vector<float> res;
+        for (int k = 0; k < query.size();k++)
+            res.push_back((float)std::bit_cast<double>(query[k]));
+        responses.push_back(res);
+        index_responses.push_back(idx);
+        //std::cout << "Size of return: " << query.size()*sizeof(query[0]) << " for query " << idx << std::endl;
+
+    }
+    std::cout << "PIR 1 Upload " << embedding_pir.UploadCostPerQuery()*unbatched_query.size() << std::endl;
+    std::cout << "PIR 1 Download " << embedding_pir.DownloadCostPerQuery()*unbatched_query.size() << std::endl;
+    /**
     for (uint64_t i = 0; i < unbatched_query.size(); i+=embedding_BatchSize) {
         std::unordered_set<uint64_t> querySet;
         std::vector<uint64_t> batchQuery;
-        std::cout << std::endl << " Query " << i << ": ";
+        std::cout << " Query " << i/embedding_BatchSize << std::endl;
         for (uint64_t j = 0; j < embedding_BatchSize;j++) {
             if (i+j < unbatched_query.size())
                 batchQuery.push_back(unbatched_query[i + j]);
             else batchQuery.push_back(0);
-            std::cout << " " << batchQuery[j];
+            //std::cout << " " << batchQuery[j];
         }
 
         auto response = embedding_pir.Query(batchQuery);
-        //std::cout << "Number of responses: " << response.size() << std::endl;
+        phase1_download += response.size()*response[0].size()*sizeof(response[0][0]);
 
-        std::cout << std::endl;
+        //std::cout << std::endl;
         for (int j = 0; j < response.size(); j++) {
             if (response[j].size() > 0) {
-                std::cout << " " << std::setprecision(std::numeric_limits<double>::max_digits10)
-                          << std::bit_cast<double>(response[j][0]);
+                //std::cout << " " << std::setprecision(std::numeric_limits<double>::max_digits10)
+                //          << std::bit_cast<double>(response[j][0]);
                 if (response[j][0] == 0){
                     unbatched_query.push_back(unbatched_query[i+j]);
                 }
@@ -340,9 +347,10 @@ int main(){
             //for (int k = 0; k < response[j].size(); k++)
             //    std::cout << " " << std::setprecision(std::numeric_limits<double>::max_digits10) << std::bit_cast<double>(response[j][k]);
         }
-        std::cout << std::endl;
-    }
+        //std::cout << std::endl;
+    }**/
 
+    std::cout << "Computing global distances "<< std::endl;
     int top_k = 10;
     uint64_t dim = 728;
     std::vector<float> candidate_vectors;
@@ -375,58 +383,38 @@ int main(){
             queries.push_back(index_responses[indices[i]]);
         }
     }
-
     std::cout << "Top-K: ";
     for (int i = 0; i < results.size(); i++){
         std::cout << "[ " << results[i].first << " " << results[i].second << "] ";
     }
     std::cout << std::endl;
 
-
-
-    std::cout << "Loading text database ..." << std::endl;
-    constexpr uint64_t text_DBSize       = 65000;
-    constexpr uint64_t text_DBEntrySize  = 64;
-    constexpr uint64_t text_DBEntryBytes = text_DBEntrySize * 8;
-    constexpr uint64_t text_BatchSize    = 32;
-    constexpr uint64_t text_FailProb     = 20;
-
-    std::vector<uint64_t> text_rawDB(text_DBEntrySize * text_DBSize);
-    std::vector<std::string> text_DB;
-    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index.txt");
-    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index.txt");
-
-    //std::cout << "Text DB: ";
-    //for (uint64_t i = 0; i <text_DB.size(); i++)
-    //    std::cout << text_DB[i];
-    std::cout << std::endl;
-    for (uint64_t i = 0; i < text_DB.size(); ++i)
-        for (uint64_t j = 0; j < text_DB[i].size(); ++j)
-            text_rawDB[i * text_DBEntrySize + j] = int(text_DB[i][j]);
-
-    PianoPIR pir(text_DBSize, text_DBEntryBytes, text_rawDB, text_FailProb);
-
-    pir.Preprocessing();
-
-    const uint64_t maxQueryNum = pir.client_MaxQueryNum();
-
     std::cout << "Loading indices ... " << std::endl;
     //std::vector<uint64_t> queries =
             //load_centroid_indices("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/ground_truth/ground_truth.json");
             //load_centroid_indices("/home/ajanusze/PIANO-RAG/prototype/ground_truth/ground_truth.json");
     uint64_t retrieve_number = (maxQueryNum > queries.size()) ? queries.size() : maxQueryNum;
-
     std::cout << "Processing queries ... " << retrieve_number << std::endl;
     for (uint64_t i = 0; i < retrieve_number; ++i) {
         uint64_t idx = queries[i];
-
         std::vector<uint64_t> query;
         query = pir.Query(idx, /*realQuery=*/true);
-        std::cout << "Size of return: " << query.size() << " for query " << idx << std::endl;
+        //std::cout << "Size of return: " << query.size()*sizeof(query[0]) << " for query " << idx << std::endl;
+
+        /**
         for (uint64_t j = 0; j < query.size(); ++j)
             std::cout << char(query[j]);
         std::cout << std::endl;
+         **/
     }
+    std::cout << "PIR 2 Upload " << pir.UploadCostPerQuery()*queries.size() << std::endl;
+    std::cout << "PIR 2 Download " << pir.DownloadCostPerQuery()*queries.size() << std::endl;
+    auto elapsed_query_time =
+            std::chrono::duration<double>(std::chrono::steady_clock::now()-query_time_start).count();
+    std::cout << "Query time " << elapsed_query_time << std::endl;
+
+    std::cout << "Total time " << elapsed_setup_time+elapsed_query_time << std::endl;
+
 
     std::cout << "Successful RAG completion!" << std::endl;
 }

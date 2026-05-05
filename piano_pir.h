@@ -114,6 +114,8 @@ public:
 
     double   LocalStorageSize()  const;
     double   CommCostPerQuery()  const;
+    double   UploadCostPerQuery() const;
+    double   DownloadCostPerQuery() const;
     const PianoPIRConfig& Config() const { return config; }
 
     // Accessors into the client (used by SimpleBatchPianoPIR)

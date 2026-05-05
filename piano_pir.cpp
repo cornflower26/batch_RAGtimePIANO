@@ -306,6 +306,7 @@ std::vector<uint64_t> PianoPIRClient::Query(uint64_t idx,
     for (uint64_t i = 0; i < config.SetSize; ++i) {
         querySetOffset[i] = static_cast<uint32_t>(querySet[i] & chunkMask);
     }
+    //std::cout << "Query size: " << querySetOffset.size()*sizeof(querySetOffset) << std::endl;
 
     std::vector<uint64_t> response = server.PrivateQuery(querySetOffset);
 
@@ -434,6 +435,14 @@ double PianoPIR::CommCostPerQuery() const {
     // Upload: SetSize uint32 (offsets)
     // Download: DBEntrySize uint64 (XOR response)
     return static_cast<double>(config.SetSize * 4 + config.DBEntrySize * 8);
+}
+
+double  PianoPIR::UploadCostPerQuery() const {
+    return static_cast<double>(config.SetSize * 4);
+}
+
+double   PianoPIR::DownloadCostPerQuery() const{
+    return static_cast<double>(config.DBEntrySize * 8);
 }
 /***
 SimpleBatchPianoPIR::SimpleBatchPianoPIR(uint64_t DBSize,

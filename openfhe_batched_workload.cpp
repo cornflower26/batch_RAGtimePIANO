@@ -533,10 +533,14 @@ int RunEncryptCentroid(const CliArgs& args) {
   std::vector<double> packedNorm(static_cast<size_t>(slotsUsed), 0.0);
   std::fill_n(packedNorm.begin(), centroidsPerCiphertext, normSquared);
 
+  int upload = 0;
   SaveCiphertext(outputDir + "/encrypted_query_centroid_batched.bin",
                  cc->Encrypt(pk, cc->MakeCKKSPackedPlaintext(packedQuery)));
+  upload += sizeof(cc->Encrypt(pk, cc->MakeCKKSPackedPlaintext(packedQuery)));
   SaveCiphertext(outputDir + "/encrypted_norm_centroid_batched.bin",
                  cc->Encrypt(pk, cc->MakeCKKSPackedPlaintext(packedNorm)));
+  upload += sizeof(cc->Encrypt(pk, cc->MakeCKKSPackedPlaintext(packedNorm)));
+  std::cout << " FHE Distance upload " << upload << std::endl;
 
   std::ofstream out(outputDir + "/centroid_batch_query_metadata.json");
   out << "{\n";
@@ -676,6 +680,7 @@ int RunDecryptCentroid(const CliArgs& args) {
   const int nBatches = ParseRequiredInt(metadataPath, "n_batches");
 
   std::vector<std::pair<double, int>> scored;
+  int distance_sizes = 0;
   scored.reserve(nCentroids);
   for (int batchIdx = 0; batchIdx < nBatches; ++batchIdx) {
     const std::string inFile =
@@ -684,6 +689,7 @@ int RunDecryptCentroid(const CliArgs& args) {
       continue;
     }
     Ciphertext<DCRTPoly> ct = LoadCiphertext(inFile);
+    distance_sizes += sizeof(ct);
     Plaintext pt;
     cc->Decrypt(sk, ct, &pt);
     const auto values = pt->GetRealPackedValue();
@@ -695,6 +701,7 @@ int RunDecryptCentroid(const CliArgs& args) {
       scored.emplace_back(values[static_cast<size_t>(b)], centroidIdx);
     }
   }
+  std::cout << "FHE Distance download " << distance_sizes << std::endl;
   std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
     return a.first < b.first;
   });
