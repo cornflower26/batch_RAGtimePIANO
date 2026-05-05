@@ -189,17 +189,16 @@ namespace {
     }
 } //namespace
 
-int main(){
+int batched_regular_main(){
     CliArgs args;
     args.kv.push_back({"--context-dir", "test"});
     args.kv.push_back({"--input-vector", "../query_768d_from_k4096_centroid0.txt"});
-    args.kv.push_back({"--centroids-file", "../centroids_10m.txt"});
+    args.kv.push_back({"--centroids-file", "../centroids_10k.txt"});
     const std::string workDir = "test";
     const std::string outputJson = "test/top_k_results.json";
     bool mac = false;
-    // CHANGE ME !!!
     constexpr uint64_t DBsize = 1120486;
-            //702873, 1120486
+    //702873, 1120486
 
     constexpr uint64_t embedding_DBSize       = DBsize;
     constexpr uint64_t embedding_DBEntrySize  = 768;
@@ -216,25 +215,21 @@ int main(){
     std::cout << "Loading embedding database ... " << std::endl;
     std::vector<uint64_t> embedding_rawDB(embedding_DBEntrySize * embedding_DBSize);
     std::vector<std::vector<uint64_t>> embedding_DB;
-    // CHANGE ME !!!
     if (mac) embedding_DB = load_json_distances("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/modified_faiss_10000000.json");
     else embedding_DB = load_json_distances("/home/ajanusze/PIANO-RAG/modified_faiss_10000000.json");
     std::unordered_map<uint64_t, std::vector<uint64_t>> centroidToIndex;
     std::cout << "Loading centroid mapping ... " << std::endl;
-    // CHANGE ME !!!
     if (mac) centroidToIndex = load_json_mapping("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/10000000_lists.json");
     else centroidToIndex = load_json_mapping("/home/ajanusze/PIANO-RAG/prototype/data/10000000_lists.json");
     std::cout << "Loading text database ..." << std::endl;
     std::vector<std::string> text_DB;
-    // CHANGE ME !!
-    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index_10000000_1024.txt");
-    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index_10000000_1024.txt");
-    std::cout << "Embedding database to raw database size " << embedding_DB.size() << std::endl;
+    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index_1000000_1024.txt");
+    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index_1000000_1024.txt");
+
     for (uint64_t i = 0; i < DBsize; ++i)
         for (uint64_t j = 0; j < embedding_DB[i].size(); ++j) {
             embedding_rawDB[i * embedding_DBEntrySize + j] = embedding_DB[i][j];
         }
-    std::cout << "Text database to raw database size " << text_DB.size() << std::endl;
     std::vector<uint64_t> text_rawDB(text_DBEntrySize * text_DBSize);
     for (uint64_t i = 0; i < DBsize; ++i)
         for (uint64_t j = 0; j < text_DB[i].size(); ++j)
@@ -289,8 +284,8 @@ int main(){
     auto query_time_start = std::chrono::steady_clock::now();
     std::cout << "Loading centroid indices ... " << std::endl;
     std::vector<uint64_t> centroidIndices =
-    //        load_centroid_indices("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/rag_operations/ground_truth.json");
-    //        load_centroid_indices("/home/ajanusze/PIANO-RAG/decrypted_results/top_k_results.json");
+            //        load_centroid_indices("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/rag_operations/ground_truth.json");
+            //        load_centroid_indices("/home/ajanusze/PIANO-RAG/decrypted_results/top_k_results.json");
             load_centroid_indices("test/top_k_results.json");
     std::vector<uint64_t> unbatched_query = CentroidToIndex(centroidIndices,centroidToIndex);
     //while (unbatched_query.size()%embedding_BatchSize != 0) unbatched_query.push_back(0);
@@ -396,8 +391,8 @@ int main(){
 
     std::cout << "Loading indices ... " << std::endl;
     //std::vector<uint64_t> queries =
-            //load_centroid_indices("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/ground_truth/ground_truth.json");
-            //load_centroid_indices("/home/ajanusze/PIANO-RAG/prototype/ground_truth/ground_truth.json");
+    //load_centroid_indices("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/ground_truth/ground_truth.json");
+    //load_centroid_indices("/home/ajanusze/PIANO-RAG/prototype/ground_truth/ground_truth.json");
     uint64_t retrieve_number = (maxQueryNum > queries.size()) ? queries.size() : maxQueryNum;
     std::cout << "Processing queries ... " << retrieve_number << std::endl;
     for (uint64_t i = 0; i < retrieve_number; ++i) {

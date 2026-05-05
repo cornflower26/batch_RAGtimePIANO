@@ -40,6 +40,7 @@ add_library(pianopir STATIC
         piano_pir.cpp
         util.cpp
         batch_piano_pir.cpp
+        partition_batched.cpp
 )
 target_link_libraries(pianopir PUBLIC faiss)
 
@@ -59,7 +60,8 @@ target_link_libraries(pianopir PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 # ---- Executable -------------------------------------------------------------
 add_executable(batch_pir regular_test.cpp)
-add_executable(main main.cpp)
+add_executable(main main.cpp
+        regular_batched.cpp)
 target_link_libraries(main PRIVATE pianopir)
 target_link_libraries(batch_pir PRIVATE pianopir)
 
