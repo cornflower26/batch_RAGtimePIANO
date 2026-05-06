@@ -193,12 +193,12 @@ int main(){
     CliArgs args;
     args.kv.push_back({"--context-dir", "test"});
     args.kv.push_back({"--input-vector", "../query_768d_from_k4096_centroid0.txt"});
-    args.kv.push_back({"--centroids-file", "../centroids_10m.txt"});
+    args.kv.push_back({"--centroids-file", "../centroids_1m.txt"});
     const std::string workDir = "test";
     const std::string outputJson = "test/top_k_results.json";
     bool mac = false;
     // CHANGE ME !!!
-    constexpr uint64_t DBsize = 1120486;
+    constexpr uint64_t DBsize = 702873;
             //702873, 1120486
 
     constexpr uint64_t embedding_DBSize       = DBsize;
@@ -217,18 +217,18 @@ int main(){
     std::vector<uint64_t> embedding_rawDB(embedding_DBEntrySize * embedding_DBSize);
     std::vector<std::vector<uint64_t>> embedding_DB;
     // CHANGE ME !!!
-    if (mac) embedding_DB = load_json_distances("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/modified_faiss_10000000.json");
-    else embedding_DB = load_json_distances("/home/ajanusze/PIANO-RAG/modified_faiss_10000000.json");
+    if (mac) embedding_DB = load_json_distances("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/modified_faiss_10000.json");
+    else embedding_DB = load_json_distances("/home/ajanusze/PIANO-RAG/modified_faiss_1000000.json");
     std::unordered_map<uint64_t, std::vector<uint64_t>> centroidToIndex;
     std::cout << "Loading centroid mapping ... " << std::endl;
     // CHANGE ME !!!
-    if (mac) centroidToIndex = load_json_mapping("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/10000000_lists.json");
-    else centroidToIndex = load_json_mapping("/home/ajanusze/PIANO-RAG/prototype/data/10000000_lists.json");
+    if (mac) centroidToIndex = load_json_mapping("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/10000_lists.json");
+    else centroidToIndex = load_json_mapping("/home/ajanusze/PIANO-RAG/prototype/data/1000000_lists.json");
     std::cout << "Loading text database ..." << std::endl;
     std::vector<std::string> text_DB;
     // CHANGE ME !!
-    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index_10000000_1024.txt");
-    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index_10000000_1024.txt");
+    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index.txt");
+    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index_1000000_1024.txt");
     std::cout << "Embedding database to raw database size " << embedding_DB.size() << std::endl;
     for (uint64_t i = 0; i < DBsize; ++i)
         for (uint64_t j = 0; j < embedding_DB[i].size(); ++j) {
@@ -276,6 +276,7 @@ int main(){
         CliArgs decArgs = args;
         decArgs.kv.push_back({"--encrypted-distances-dir", workDir + "/encrypted_distances"});
         decArgs.kv.push_back({"--output-json", outputJson});
+        decArgs.kv.push_back({"--top-k","100"});
 
         std::cout << "Run DecryptCentroid" << std::endl;
         RunDecryptCentroid(decArgs);
@@ -302,7 +303,8 @@ int main(){
     std::cout << "Computing queries ... " << unbatched_query.size() << std::endl;
     std::vector<std::vector<float>> responses;
     std::vector<uint64_t> index_responses;
-    uint64_t ret_num = (maxQueryNum > unbatched_query.size()) ? unbatched_query.size() : pir.client_MaxQueryNum();
+    uint64_t ret_num = (embedding_pir.client_MaxQueryNum() > unbatched_query.size())
+            ? unbatched_query.size() : embedding_pir.client_MaxQueryNum();
     std::cout << "Processing queries ... " << ret_num << std::endl;
     for (uint64_t i = 0; i < ret_num; ++i) {
         uint64_t idx = unbatched_query[i];

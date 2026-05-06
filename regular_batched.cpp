@@ -30,170 +30,12 @@
 
 using namespace lbcrypto;
 
-namespace {
 
-    void centroids() {
-        const int paddedDim = 1024;
-        const std::string inputVectorPath = "../query_768d_from_k4096_centroid0.txt";
-
-
-        const std::string outputDir = "test";
-        std::filesystem::create_directories(outputDir);
-        PublicKey <DCRTPoly> pk = LoadPublicKey("test/public_key.bin");;
-        CryptoContext<DCRTPoly> cc = pk->GetCryptoContext();
-        const int centroidsPerCiphertext = 8;
-
-        const std::vector<double> query = ReadVectorFile(inputVectorPath);
-        const int queryDim = static_cast<int>(query.size());
-        if (queryDim > paddedDim) {
-            throw std::runtime_error("Query dimension exceeds --padded-dim");
-        }
-
-        const int slotsUsed = paddedDim * centroidsPerCiphertext;
-        std::vector<double> packedQuery(static_cast<size_t>(slotsUsed), 0.0);
-        for (int d = 0; d < queryDim; ++d) {
-            for (int b = 0; b < centroidsPerCiphertext; ++b) {
-                packedQuery[static_cast<size_t>(d * centroidsPerCiphertext + b)] =
-                        query[static_cast<size_t>(d)];
-            }
-        }
-
-        const double normSquared = std::inner_product(query.begin(), query.end(), query.begin(), 0.0);
-        std::vector<double> packedNorm(static_cast<size_t>(slotsUsed), 0.0);
-        std::fill_n(packedNorm.begin(), centroidsPerCiphertext, normSquared);
-
-        auto encQuery = cc->Encrypt(pk, cc->MakeCKKSPackedPlaintext(packedQuery));
-        auto encNorm = cc->Encrypt(pk, cc->MakeCKKSPackedPlaintext(packedNorm));
-
-        std::ofstream out(outputDir + "/centroid_batch_query_metadata.json");
-        out << "{\n";
-        out << "  \"format_version\": \"openfhe_centroid_batch_query_v1\",\n";
-        out << "  \"backend\": \"openfhe_cpp\",\n";
-        out << "  \"query_dim\": " << queryDim << ",\n";
-        out << "  \"padded_dim\": " << paddedDim << ",\n";
-        out << "  \"centroids_per_ciphertext\": " << centroidsPerCiphertext << ",\n";
-        out << "  \"slots_per_ciphertext\": " << slotsUsed << "\n";
-        out << "}\n";
-
-        std::cout << "Encrypted replicated query for centroid batching to " << outputDir << "\n";
-
-        const auto centroids = ReadMatrixFile("../centroids.txt");
-        const int nCentroids = static_cast<int>(centroids.size());
-        const int centroidDim = static_cast<int>(centroids.front().size());
-        if (centroidDim <= 0 || centroidDim > paddedDim) {
-            throw std::runtime_error("Centroid dimension must be > 0 and <= --padded-dim");
-        }
-        for (const auto &centroid: centroids) {
-            if (static_cast<int>(centroid.size()) != centroidDim) {
-                throw std::runtime_error("Centroid dimension mismatch in centroids file");
-            }
-        }
-        int numThreads = 20;
-        int batchSize = 1;
-
-        SetThreadCount(numThreads);
-        const int nBatches = (nCentroids + centroidsPerCiphertext - 1) / centroidsPerCiphertext;
-        std::cout << "Computing centroid-batched distances for " << nCentroids
-                  << " centroids with " << MaxThreadCount() << " thread(s).\n";
-
-        const auto wallStart = std::chrono::high_resolution_clock::now();
-        std::atomic<bool> failed(false);
-        std::string failureMessage;
-        std::vector<Ciphertext<DCRTPoly>> distances(nBatches);
-
-#pragma omp parallel for schedule(dynamic, batchSize)
-        for (int batchIdx = 0; batchIdx < nBatches; ++batchIdx) {
-            if (failed.load()) {
-                continue;
-            }
-            try {
-                const int centroidStart = batchIdx * centroidsPerCiphertext;
-                const int centroidsInBatch =
-                        std::min(centroidsPerCiphertext, nCentroids - centroidStart);
-                std::vector<double> centroidPacked(static_cast<size_t>(slotsUsed), 0.0);
-                std::vector<double> centroidNormPacked(static_cast<size_t>(slotsUsed), 0.0);
-                for (int b = 0; b < centroidsInBatch; ++b) {
-                    const auto &centroid = centroids[static_cast<size_t>(centroidStart + b)];
-                    centroidNormPacked[static_cast<size_t>(b)] =
-                            std::inner_product(centroid.begin(), centroid.end(), centroid.begin(), 0.0);
-                    for (int d = 0; d < centroidDim; ++d) {
-                        centroidPacked[static_cast<size_t>(d * centroidsPerCiphertext + b)] =
-                                centroid[static_cast<size_t>(d)];
-                    }
-                }
-                Ciphertext<DCRTPoly> dot = cc->EvalMult(encQuery, cc->MakeCKKSPackedPlaintext(centroidPacked));
-                for (int step = 1; step < paddedDim; step <<= 1) {
-                    dot = cc->EvalAdd(dot, cc->EvalAtIndex(dot, step * centroidsPerCiphertext));
-                }
-                Ciphertext<DCRTPoly> distance = cc->EvalSub(
-                        cc->EvalAdd(encNorm, cc->MakeCKKSPackedPlaintext(centroidNormPacked)),
-                        cc->EvalAdd(dot, dot));
-                distances[batchIdx] = distance;
-            } catch (const std::exception &ex) {
-                failed.store(true);
-#pragma omp critical
-                { failureMessage = ex.what(); }
-            }
-        }
-        if (failed.load()) {
-            throw std::runtime_error(failureMessage);
-        }
-
-        std::ofstream nout(outputDir + "/distances_metadata.json");
-        nout << "{\n";
-        nout << "  \"backend\": \"openfhe_cpp\",\n";
-        nout << "  \"format_version\": \"openfhe_centroid_batch_distances_v1\",\n";
-        nout << "  \"n_centroids\": " << nCentroids << ",\n";
-        nout << "  \"n_distances\": " << nCentroids << ",\n";
-        nout << "  \"centroid_dim\": " << centroidDim << ",\n";
-        nout << "  \"padded_dim\": " << paddedDim << ",\n";
-        nout << "  \"centroids_per_ciphertext\": " << centroidsPerCiphertext << ",\n";
-        nout << "  \"n_batches\": " << nBatches << "\n";
-        nout << "}\n";
-
-        const double elapsedSec =
-                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - wallStart).count();
-        std::cout << "Computed " << nCentroids << " centroid distances in "
-                  << elapsedSec << " s.\n";
-
-        PrivateKey <DCRTPoly> sk = LoadSecretKey("test/secret_key.bin");
-
-        std::vector<std::pair<double, int>> scored;
-        scored.reserve(nCentroids);
-        for (int batchIdx = 0; batchIdx < nBatches; ++batchIdx) {
-            Ciphertext<DCRTPoly> ct = distances[batchIdx];
-            Plaintext pt;
-            cc->Decrypt(sk, ct, &pt);
-            const auto values = pt->GetRealPackedValue();
-            for (int b = 0; b < centroidsPerCiphertext; ++b) {
-                const int centroidIdx = batchIdx * centroidsPerCiphertext + b;
-                if (centroidIdx >= nCentroids || static_cast<size_t>(b) >= values.size()) {
-                    break;
-                }
-                scored.emplace_back(values[static_cast<size_t>(b)], centroidIdx);
-            }
-        }
-        std::sort(scored.begin(), scored.end(), [](const auto &a, const auto &b) {
-            return a.first < b.first;
-        });
-        const int topK = 100;
-        const int keep = std::min(topK, static_cast<int>(scored.size()));
-        std::vector<double> topDistances;
-        std::vector<int> topIndices;
-        for (int i = 0; i < keep; ++i) {
-            topDistances.push_back(scored[static_cast<size_t>(i)].first);
-            topIndices.push_back(scored[static_cast<size_t>(i)].second);
-        }
-        WriteJsonTopK("test/top_k_results.json", topDistances, topIndices);
-        std::cout << "Decrypted " << scored.size() << " packed centroid distances.\n";
-    }
-} //namespace
-
-int batched_regular_main(){
+int main(){
     CliArgs args;
     args.kv.push_back({"--context-dir", "test"});
     args.kv.push_back({"--input-vector", "../query_768d_from_k4096_centroid0.txt"});
-    args.kv.push_back({"--centroids-file", "../centroids_10k.txt"});
+    args.kv.push_back({"--centroids-file", "../centroids_10m.txt"});
     const std::string workDir = "test";
     const std::string outputJson = "test/top_k_results.json";
     bool mac = false;
@@ -215,16 +57,16 @@ int batched_regular_main(){
     std::cout << "Loading embedding database ... " << std::endl;
     std::vector<uint64_t> embedding_rawDB(embedding_DBEntrySize * embedding_DBSize);
     std::vector<std::vector<uint64_t>> embedding_DB;
-    if (mac) embedding_DB = load_json_distances("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/modified_faiss_10000000.json");
+    if (mac) embedding_DB = load_json_distances("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/modified_faiss_100000.json");
     else embedding_DB = load_json_distances("/home/ajanusze/PIANO-RAG/modified_faiss_10000000.json");
     std::unordered_map<uint64_t, std::vector<uint64_t>> centroidToIndex;
     std::cout << "Loading centroid mapping ... " << std::endl;
-    if (mac) centroidToIndex = load_json_mapping("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/10000000_lists.json");
+    if (mac) centroidToIndex = load_json_mapping("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/10000_lists.json");
     else centroidToIndex = load_json_mapping("/home/ajanusze/PIANO-RAG/prototype/data/10000000_lists.json");
     std::cout << "Loading text database ..." << std::endl;
     std::vector<std::string> text_DB;
-    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index_1000000_1024.txt");
-    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index_1000000_1024.txt");
+    if (mac) text_DB =  load_text_database("/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index.txt");
+    else text_DB = load_text_database("/home/ajanusze/PIANO-RAG/uniform_index_10000000_1024.txt");
 
     for (uint64_t i = 0; i < DBsize; ++i)
         for (uint64_t j = 0; j < embedding_DB[i].size(); ++j) {
@@ -238,7 +80,7 @@ int batched_regular_main(){
 
     std::cout << "Server and Client One-time Setup" << std::endl;
     auto pre_setup_time_start = std::chrono::steady_clock::now();
-    PianoPIR embedding_pir(embedding_DBSize, embedding_DBEntryBytes,embedding_rawDB, embedding_FailProb);
+    SimpleBatchPianoPIR embedding_pir(embedding_DBSize, embedding_DBEntryBytes, embedding_BatchSize,embedding_rawDB, embedding_FailProb);
     embedding_pir.Preprocessing();
     PianoPIR pir(text_DBSize, text_DBEntryBytes, text_rawDB, text_FailProb);
     pir.Preprocessing();
@@ -256,7 +98,8 @@ int batched_regular_main(){
     std::cout << "Setup time" << std::endl;
     auto setup_time_start = std::chrono::steady_clock::now();
     if (mac){
-        centroids();
+        //centroids();
+        std::cout << "Batching not available on mac currently" << std::endl;
     }
     else {
         std::cout << "Run EncryptCentroid" << std::endl;
@@ -271,6 +114,7 @@ int batched_regular_main(){
         CliArgs decArgs = args;
         decArgs.kv.push_back({"--encrypted-distances-dir", workDir + "/encrypted_distances"});
         decArgs.kv.push_back({"--output-json", outputJson});
+        decArgs.kv.push_back({"--top-k","100"});
 
         std::cout << "Run DecryptCentroid" << std::endl;
         RunDecryptCentroid(decArgs);
@@ -297,22 +141,40 @@ int batched_regular_main(){
     std::cout << "Computing queries ... " << unbatched_query.size() << std::endl;
     std::vector<std::vector<float>> responses;
     std::vector<uint64_t> index_responses;
-    uint64_t ret_num = (maxQueryNum > unbatched_query.size()) ? unbatched_query.size() : pir.client_MaxQueryNum();
-    std::cout << "Processing queries ... " << ret_num << std::endl;
-    for (uint64_t i = 0; i < ret_num; ++i) {
-        uint64_t idx = unbatched_query[i];
-        std::vector<uint64_t> query;
-        query = embedding_pir.Query(idx, /*realQuery=*/true);
-        std::vector<float> res;
-        for (int k = 0; k < query.size();k++)
-            res.push_back((float)std::bit_cast<double>(query[k]));
-        responses.push_back(res);
-        index_responses.push_back(idx);
-        //std::cout << "Size of return: " << query.size()*sizeof(query[0]) << " for query " << idx << std::endl;
+    //uint64_t ret_num = (maxQueryNum > unbatched_query.size()) ? unbatched_query.size() : pir.client_MaxQueryNum();
+    //std::cout << "Processing queries ... " << ret_num << std::endl;
 
+    int partitionSize = (embedding_DBSize +
+            (embedding_BatchSize / kRealQueryPerPartition) - 1) / (embedding_BatchSize / kRealQueryPerPartition);
+    std::vector<std::vector<uint64_t>> batched_queries = makeOptimizedBatchesContiguous(
+            unbatched_query,embedding_DBSize,
+            partitionSize,2);
+    std::cout << "Number of batched queries " <<
+        batched_queries.size() << " of size " << batched_queries[0].size() << std::endl;
+    for (uint64_t i = 0; i < batched_queries.size(); i++) {
+        auto response = embedding_pir.Query(batched_queries[i]);
+
+        //std::cout << std::endl;
+        for (int j = 0; j < response.size(); j++) {
+            if (response[j].size() > 0) {
+                if (response[j][0] == 0){
+                    unbatched_query.push_back(unbatched_query[i+j]);
+                    //std::cout << " " << std::setprecision(std::numeric_limits<double>::max_digits10)
+                    //          << std::bit_cast<double>(response[j][0]);
+                }
+                else{
+                    std::vector<float> res;
+                    for (int k = 0; k < response[j].size();k++)
+                        res.push_back((float)std::bit_cast<double>(response[j][k]));
+                    responses.push_back(res);
+                    index_responses.push_back(batched_queries[i][j]);
+                }
+            }
+            //for (int k = 0; k < response[j].size(); k++)
+            //    std::cout << " " << std::setprecision(std::numeric_limits<double>::max_digits10) << std::bit_cast<double>(response[j][k]);
+        }
+        //std::cout << std::endl;
     }
-    std::cout << "PIR 1 Upload " << embedding_pir.UploadCostPerQuery()*unbatched_query.size() << std::endl;
-    std::cout << "PIR 1 Download " << embedding_pir.DownloadCostPerQuery()*unbatched_query.size() << std::endl;
     /**
     for (uint64_t i = 0; i < unbatched_query.size(); i+=embedding_BatchSize) {
         std::unordered_set<uint64_t> querySet;
@@ -326,13 +188,12 @@ int batched_regular_main(){
         }
 
         auto response = embedding_pir.Query(batchQuery);
-        phase1_download += response.size()*response[0].size()*sizeof(response[0][0]);
 
         //std::cout << std::endl;
         for (int j = 0; j < response.size(); j++) {
             if (response[j].size() > 0) {
                 //std::cout << " " << std::setprecision(std::numeric_limits<double>::max_digits10)
-                //          << std::bit_cast<double>(response[j][0]);
+                  //        << std::bit_cast<double>(response[j][0]);
                 if (response[j][0] == 0){
                     unbatched_query.push_back(unbatched_query[i+j]);
                 }
@@ -349,6 +210,8 @@ int batched_regular_main(){
         }
         //std::cout << std::endl;
     }**/
+    std::cout << "PIR 1 Upload " << embedding_pir.UploadCostPerBatchOnline()*unbatched_query.size() << std::endl;
+    std::cout << "PIR 1 Download " << embedding_pir.DownloadCostPerBatchOnline()*unbatched_query.size() << std::endl;
 
     std::cout << "Computing global distances "<< std::endl;
     int top_k = 10;

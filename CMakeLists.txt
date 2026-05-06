@@ -40,7 +40,6 @@ add_library(pianopir STATIC
         piano_pir.cpp
         util.cpp
         batch_piano_pir.cpp
-        partition_batched.cpp
 )
 target_link_libraries(pianopir PUBLIC faiss)
 
@@ -60,10 +59,13 @@ target_link_libraries(pianopir PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 # ---- Executable -------------------------------------------------------------
 add_executable(batch_pir regular_test.cpp)
-add_executable(main main.cpp
-        regular_batched.cpp)
+add_executable(main main.cpp)
+add_executable(regular_batch_main regular_batched.cpp)
+add_executable(partition_batch_main partition_batched.cpp)
 target_link_libraries(main PRIVATE pianopir)
+target_link_libraries(regular_batch_main PRIVATE pianopir)
 target_link_libraries(batch_pir PRIVATE pianopir)
+target_link_libraries(partition_batch_main PRIVATE pianopir)
 
 add_library(openfhecorelib SHARED IMPORTED)
 add_library(openfhepkelib SHARED IMPORTED)

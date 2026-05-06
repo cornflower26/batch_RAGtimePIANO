@@ -170,6 +170,9 @@ public:
 
     double LocalStorageSize()        const;
     uint64_t CommCostPerBatchOnline() const;
+    uint64_t UploadCostPerBatchOnline() const;
+    uint64_t DownloadCostPerBatchOnline() const;
+
     uint64_t CommCostPerBatchOffline() const { return commCostPerBatchOffline; }
     double PreprocessingTime()        const { return preprocessingTime; }
 

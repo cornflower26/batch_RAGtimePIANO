@@ -262,3 +262,19 @@ uint64_t SimpleBatchPianoPIR::CommCostPerBatchOnline() const {
     }
     return static_cast<uint64_t>(total);
 }
+
+uint64_t SimpleBatchPianoPIR::UploadCostPerBatchOnline() const {
+    double total = 0.0;
+    for (const auto& p: subPIR){
+        total += p->UploadCostPerQuery() * static_cast<double>(kQueryPerPartition);
+    }
+    return static_cast<uint64_t>(total);
+}
+
+uint64_t SimpleBatchPianoPIR::DownloadCostPerBatchOnline() const {
+    double total = 0.0;
+    for (const auto& p: subPIR){
+        total += p->DownloadCostPerQuery() * static_cast<double>(kQueryPerPartition);
+    }
+    return static_cast<uint64_t>(total);
+}
