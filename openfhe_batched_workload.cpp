@@ -1,5 +1,11 @@
 #if __has_include(<openfhe.h>)
 #include <openfhe.h>
+#include "cryptocontext-ser.h"
+#include "ciphertext-ser.h"
+#include "key/key-ser.h"
+#include "scheme/bfvrns/bfvrns-ser.h"
+#include "scheme/bgvrns/bgvrns-ser.h"
+#include "scheme/ckksrns/ckksrns-ser.h"
 #elif __has_include(<pke/openfhe.h>)
 #include <pke/openfhe.h>
 #elif __has_include(<openfhe/pke/openfhe.h>)
@@ -626,9 +632,10 @@ int RunComputeCentroid(const CliArgs& args) {
       for (int step = 1; step < paddedDim; step <<= 1) {
         dot = cc->EvalAdd(dot, cc->EvalAtIndex(dot, step * centroidsPerCiphertext));
       }
-      Ciphertext<DCRTPoly> distance = cc->EvalSub(
-          cc->EvalAdd(encNorm, cc->MakeCKKSPackedPlaintext(centroidNormPacked)),
-          cc->EvalAdd(dot, dot));
+        Plaintext ptCentroidNorm = cc->MakeCKKSPackedPlaintext(centroidNormPacked);
+        Ciphertext<DCRTPoly> distance = cc->EvalSub(
+                cc->EvalAdd(encNorm, ptCentroidNorm),
+                cc->EvalAdd(dot, dot));
       SaveCiphertext(outputDir + "/encrypted_distance_batch_" + FormatIndex(batchIdx) + ".bin",
                      distance);
     } catch (const std::exception& ex) {
@@ -870,9 +877,10 @@ int RunComputeQueryCentroid(const CliArgs& args) {
         for (int step = 1; step < paddedDim; step <<= 1) {
           dot = cc->EvalAdd(dot, cc->EvalAtIndex(dot, step * lanes));
         }
-        Ciphertext<DCRTPoly> distance = cc->EvalSub(
-            cc->EvalAdd(encNorm, cc->MakeCKKSPackedPlaintext(centroidNormPacked)),
-            cc->EvalAdd(dot, dot));
+          Plaintext ptCentroidNorm = cc->MakeCKKSPackedPlaintext(centroidNormPacked);
+          Ciphertext<DCRTPoly> distance = cc->EvalSub(
+                  cc->EvalAdd(encNorm, ptCentroidNorm),
+                  cc->EvalAdd(dot, dot));
         SaveCiphertext(outputDir + "/encrypted_distance_qbatch_" + FormatIndex(qb) +
                            "_cbatch_" + FormatIndex(cb) + ".bin",
                        distance);

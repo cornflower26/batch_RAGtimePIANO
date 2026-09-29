@@ -334,64 +334,49 @@ static std::vector<std::vector<uint64_t>> makeOptimizedBatchesContiguous(
     return batches;
 }
 
-static std::vector<std::vector<uint64_t>>  reorderDBForBatchPIR(
-        std::vector<std::vector<uint64_t>>& rawDBUnflattened,
-        const std::unordered_map<uint64_t, std::vector<uint64_t>>& mapPartitions,
-        uint64_t DBEntrySize,
-        uint64_t BatchSize,
-        std::unordered_map<uint64_t, uint64_t> &oldToNewIndex
+static void repartitionEqualSize(
+        const std::unordered_map<uint64_t, std::vector<uint64_t>>& oldPartitions,
+        std::vector<uint64_t>& newIndex,
+        uint64_t newPartitionSize,
+        uint64_t maxPerOldPartition = 2
 ) {
-    const uint64_t kRealQueryPerPartition = 2;
-    const uint64_t DBSize = rawDBUnflattened.size();
+    uint64_t totalElements = 0;
+    std::vector<std::vector<uint64_t>> newPartitions;
 
-    const uint64_t PartitionNum  = BatchSize / kRealQueryPerPartition;
-    const uint64_t PartitionSize = (DBSize + PartitionNum - 1) / PartitionNum;
+    for (const auto& [oldPid, entries] : oldPartitions) {
+        totalElements += entries.size();
+    }
 
-    uint64_t paddedPartitionSize =
-            PartitionSize + kRealQueryPerPartition;
-    uint64_t paddedDBSize = PartitionNum * paddedPartitionSize;
+    if (totalElements % newPartitionSize != 0) {
+        throw std::runtime_error(
+                "Total database size must be divisible by newPartitionSize, or padding is required."
+        );
+    }
 
+    uint64_t numNewPartitions = totalElements / newPartitionSize;
 
-    // new PIR partitions, still unflattened for now
-    std::vector<std::vector<std::vector<uint64_t>>> pirPartitions(PartitionNum);
+    newPartitions.clear();
+    newPartitions.resize(numNewPartitions);
 
-    // For each PIR partition, track how many entries from each map partition it has
-    std::vector<std::unordered_map<uint64_t, uint64_t>> clusterCounts(PartitionNum);
-    int placedElements = 0;
+    // count how many entries from each old partition go into each new partition
+    std::vector<std::unordered_map<int, uint64_t>> counts(numNewPartitions);
 
-    for (const auto& [clusterID, dbIndices] : mapPartitions) {
-        if (dbIndices.size() > PartitionNum * kRealQueryPerPartition) {
-            throw std::invalid_argument(
-                    "Cluster " + std::to_string(clusterID) +
-                    " is too large to spread across PIR partitions with at most " +
-                    std::to_string(kRealQueryPerPartition) + " entries per PIR partition"
-            );
-        }
+    for (const auto& [oldPid, entries] : oldPartitions) {
+        uint64_t targetPartition = 0;
 
-        uint64_t nextPartition = 0;
-
-        for (uint64_t oldIndex : dbIndices) {
+        for (uint64_t entry : entries) {
             bool placed = false;
-            for (uint64_t tries = 0; tries < PartitionNum; ++tries) {
-                uint64_t p = (nextPartition + tries) % PartitionNum;
 
-                bool hasRoomInPartition =
-                        pirPartitions[p].size() < paddedPartitionSize;
-                bool hasRoomForCluster =
-                        clusterCounts[p][clusterID] < kRealQueryPerPartition;
+            for (uint64_t tries = 0; tries < numNewPartitions; tries++) {
+                uint64_t p = (targetPartition + tries) % numNewPartitions;
 
-                if (hasRoomInPartition && hasRoomForCluster) {
-                    pirPartitions[p].push_back(rawDBUnflattened[oldIndex]);
-                    clusterCounts[p][clusterID]++;
-
-                    uint64_t localIndex = pirPartitions[p].size() - 1;
-                    uint64_t newIndex   = p * paddedPartitionSize + localIndex;
-
-                    oldToNewIndex[oldIndex] = newIndex;
-
-                    nextPartition = (p + 1) % PartitionNum;
-                    std::cout << "  Placed element from " << clusterID << " " << placedElements  << std::endl;
-                    placedElements++;
+                if (
+                        newPartitions[p].size() < newPartitionSize &&
+                        counts[p][oldPid] < maxPerOldPartition
+                        ) {
+                    newPartitions[p].push_back(entry);
+                    counts[p][oldPid]++;
+                    targetPartition = (p + 1) % numNewPartitions;
                     placed = true;
                     break;
                 }
@@ -399,53 +384,45 @@ static std::vector<std::vector<uint64_t>>  reorderDBForBatchPIR(
 
             if (!placed) {
                 throw std::runtime_error(
-                        "Could not place database entry while preserving partition constraints"
+                        "Could not repartition while preserving max-per-old-partition constraint."
                 );
             }
         }
     }
-
-    // Add padding entries.
-    std::vector<uint64_t> dummyEntry(DBEntrySize, 0);
-
-    for (uint64_t p = 0; p < PartitionNum; ++p) {
-        while (pirPartitions[p].size() < paddedPartitionSize) {
-            pirPartitions[p].push_back(dummyEntry);
+    newIndex.clear();
+    for (uint64_t i = 0; i < newPartitions.size(); i++){
+        for (uint64_t j = 0; j< newPartitions[i].size();j++){
+            newIndex.push_back(newPartitions[i][j]);
         }
     }
-
-    // Flatten PIR partitions back into one reordered unflattened DB
-    std::vector<std::vector<uint64_t>> reorderedDB;
-    reorderedDB.reserve(paddedDBSize);
-
-    for (uint64_t p = 0; p < PartitionNum; ++p) {
-        for (const auto& entry : pirPartitions[p]) {
-            reorderedDB.push_back(entry);
-        }
-    }
-
-    if (reorderedDB.size() != paddedDBSize) {
-        throw std::runtime_error("Reordered DB size does not match original DB size");
-    }
-
-    return reorderedDB;
 }
 
-static uint64_t chooseBatchSize(
-        const std::unordered_map<uint64_t, std::vector<uint64_t>>& mapPartitions,
-        uint64_t extraPartitions = 1
+static uint64_t chooseNewPartitionSize(
+        const std::unordered_map<uint64_t, std::vector<uint64_t>>& oldPartitions,
+        uint64_t maxPerOldPartition = 2
 ) {
-    uint64_t maxClusterSize = 0;
-    uint64_t kRealQueryPerPartition = 2;
+    uint64_t total = 0;
+    uint64_t maxOldSize = 0;
 
-    for (const auto& [clusterID, indices] : mapPartitions) {
-        maxClusterSize = std::max<uint64_t>(maxClusterSize, indices.size());
+    for (const auto& [pid, entries] : oldPartitions) {
+        total += entries.size();
+        maxOldSize = std::max<uint64_t>(maxOldSize, entries.size());
     }
 
-    uint64_t minPartitionNum =
-            (maxClusterSize + kRealQueryPerPartition - 1) / kRealQueryPerPartition;
+    uint64_t minNumNewPartitions =
+            (maxOldSize + maxPerOldPartition - 1) / maxPerOldPartition;
 
-    uint64_t partitionNum = minPartitionNum + extraPartitions;
+    uint64_t newPartitionSize =
+            (total + minNumNewPartitions - 1) / minNumNewPartitions;
 
-    return partitionNum * kRealQueryPerPartition;
+    while (total%newPartitionSize != 0)
+        newPartitionSize++;
+
+    return newPartitionSize;
 }
+
+static int findIndex(std::vector<uint64_t> v, int val){
+    auto it = find(v.begin(), v.end(), val);
+    return it - v.begin();
+}
+
