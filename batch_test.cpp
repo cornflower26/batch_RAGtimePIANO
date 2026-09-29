@@ -1,6 +1,4 @@
-//
-// Created by Antonia Januszewicz on 4/14/26.
-//
+
 /*
  * piano_batch_test.cpp
  *
