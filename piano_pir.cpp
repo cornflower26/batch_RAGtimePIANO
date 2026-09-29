@@ -1,6 +1,3 @@
-//
-// Created by Antonia Januszewicz on 4/8/26.
-//
 
 #include "piano_pir.h"
 #include <cassert>

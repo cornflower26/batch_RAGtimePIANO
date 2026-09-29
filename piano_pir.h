@@ -1,6 +1,3 @@
-//
-// Created by Antonia Januszewicz on 4/8/26.
-//
 
 #ifndef BATCH_PIR_PIANO_PIR_H
 #define BATCH_PIR_PIANO_PIR_H
