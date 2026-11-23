@@ -9,11 +9,13 @@
 #include <unordered_map>
 #include <vector>
 
+
 SimpleBatchPianoPIR::SimpleBatchPianoPIR(uint64_t DBSize,
                                          uint64_t DBEntryByteNum,
                                          uint64_t BatchSize,
                                          std::vector<uint64_t> rawDB,
-                                         uint64_t FailureProbLog2) {
+                                         uint64_t FailureProbLog2,
+                                         double BudgetMultiplier) {
     const uint64_t DBEntrySize = DBEntryByteNum / 8;
 
     if (rawDB.size() != DBSize * DBEntrySize) {
@@ -49,7 +51,7 @@ SimpleBatchPianoPIR::SimpleBatchPianoPIR(uint64_t DBSize,
                 rawDB.begin() + static_cast<ptrdiff_t>(end   * DBEntrySize));
 
         subPIR.push_back(std::make_unique<PianoPIR>(
-                partDBSize, DBEntryByteNum, std::move(partDB), FailureProbLog2));
+                partDBSize, DBEntryByteNum, std::move(partDB), FailureProbLog2, BudgetMultiplier));
     }
 }
 

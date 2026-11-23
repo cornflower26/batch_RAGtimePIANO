@@ -1,9 +1,27 @@
-
 #include "piano_pir.h"
 #include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <thread>
 static constexpr uint64_t DefaultProgramPoint = 0x7fffffffULL;
+
+namespace {
+    // Random offsets for every chunk; the answer is discarded. Consumes no hint.
+    void SendCoverQuery(const PianoPIRConfig &config, PianoPIRServer &server) {
+        std::mt19937_64 rng(
+                static_cast<uint64_t>(
+                        std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+        std::vector<uint32_t> offsets(config.SetSize);
+        for (uint64_t i = 0; i < config.SetSize; ++i) {
+            offsets[i] = static_cast<uint32_t>(rng() & (config.ChunkSize - 1));
+        }
+        server.PrivateQuery(offsets);
+    }
+}
 
 
 PianoPIRServer::PianoPIRServer(const PianoPIRConfig& config,
@@ -53,8 +71,9 @@ PianoPIRClient::PianoPIRClient(const PianoPIRConfig& config)
         , finishedQueryNum(0)
 {
     double dbSizeF = static_cast<double>(config.DBSize);
+    // CHANGED: budget multiplier H (1.0 reproduces the original budget).
     maxQueryNum = static_cast<uint64_t>(
-            std::sqrt(dbSizeF) * std::log(dbSizeF));
+            config.BudgetMultiplier * std::sqrt(dbSizeF) * std::log(dbSizeF));
 
     primaryHintNum = primaryNumParam(
             static_cast<double>(maxQueryNum),
@@ -213,14 +232,7 @@ std::vector<uint64_t> PianoPIRClient::Query(uint64_t idx,
 
     // Dummy query path: just send random offsets for cover traffic
     if (!realQuery) {
-        std::mt19937_64 rng(
-                static_cast<uint64_t>(
-                        std::chrono::high_resolution_clock::now().time_since_epoch().count()));
-        std::vector<uint32_t> offsets(config.SetSize);
-        for (uint64_t i = 0; i < config.SetSize; ++i) {
-            offsets[i] = static_cast<uint32_t>(rng() & (config.ChunkSize - 1));
-        }
-        server.PrivateQuery(offsets); // result discarded
+        SendCoverQuery(config, server);
         return ret;
     }
 
@@ -228,9 +240,11 @@ std::vector<uint64_t> PianoPIRClient::Query(uint64_t idx,
         throw std::out_of_range("Query: idx out of range");
     }
 
-    // Local cache hit
+    // Local cache hit. CHANGED: send a cover query so the server still sees
+    // one query per Query() call; no hint is consumed.
     auto cit = localCache.find(idx);
     if (cit != localCache.end()) {
+        SendCoverQuery(config, server);
         return cit->second;
     }
 
@@ -303,7 +317,6 @@ std::vector<uint64_t> PianoPIRClient::Query(uint64_t idx,
     for (uint64_t i = 0; i < config.SetSize; ++i) {
         querySetOffset[i] = static_cast<uint32_t>(querySet[i] & chunkMask);
     }
-    //std::cout << "Query size: " << querySetOffset.size()*sizeof(querySetOffset) << std::endl;
 
     std::vector<uint64_t> response = server.PrivateQuery(querySetOffset);
 
@@ -372,13 +385,17 @@ void PianoPIRClient::PrintStorageBreakdown() const {
 PianoPIR::PianoPIR(uint64_t DBSize,
                    uint64_t DBEntryByteNum,
                    std::vector<uint64_t> rawDB,
-                   uint64_t FailureProbLog2) {
+                   uint64_t FailureProbLog2,
+                   double BudgetMultiplier) {
     uint64_t DBEntrySize = DBEntryByteNum / 8;
     if (rawDB.size() != DBSize * DBEntrySize) {
         throw std::invalid_argument(
                 "PianoPIR: rawDB size mismatch: expected "
                 + std::to_string(DBSize * DBEntrySize)
                 + " got " + std::to_string(rawDB.size()));
+    }
+    if (!(BudgetMultiplier > 0.0)) {
+        throw std::invalid_argument("PianoPIR: BudgetMultiplier must be positive");
     }
 
     // ChunkSize = smallest power of 2 >= 2*sqrt(DBSize)
@@ -392,13 +409,14 @@ PianoPIR::PianoPIR(uint64_t DBSize,
     SetSize = (SetSize + 3) / 4 * 4;
 
     config = PianoPIRConfig{
-            .DBEntryByteNum  = DBEntryByteNum,
-            .DBEntrySize     = DBEntrySize,
-            .DBSize          = DBSize,
-            .ChunkSize       = ChunkSize,
-            .SetSize         = SetSize,
-            .ThreadNum       = 8,
-            .FailureProbLog2 = FailureProbLog2,
+            .DBEntryByteNum   = DBEntryByteNum,
+            .DBEntrySize      = DBEntrySize,
+            .DBSize           = DBSize,
+            .ChunkSize        = ChunkSize,
+            .SetSize          = SetSize,
+            .ThreadNum        = 8,
+            .FailureProbLog2  = FailureProbLog2,
+            .BudgetMultiplier = BudgetMultiplier,
     };
 
     server = std::make_unique<PianoPIRServer>(config, std::move(rawDB));
@@ -441,241 +459,3 @@ double  PianoPIR::UploadCostPerQuery() const {
 double   PianoPIR::DownloadCostPerQuery() const{
     return static_cast<double>(config.DBEntrySize * 8);
 }
-/***
-SimpleBatchPianoPIR::SimpleBatchPianoPIR(uint64_t DBSize,
-                                         uint64_t DBEntryByteNum,
-                                         uint64_t BatchSize,
-                                         std::vector<uint64_t> rawDB,
-                                         uint64_t FailureProbLog2) {
-    const uint64_t DBEntrySize = DBEntryByteNum / 8;
-
-    if (rawDB.size() != DBSize * DBEntrySize) {
-        throw std::invalid_argument(
-                "SimpleBatchPianoPIR: rawDB size mismatch: expected "
-                + std::to_string(DBSize * DBEntrySize)
-                + " got " + std::to_string(rawDB.size()));
-    }
-
-    const uint64_t PartitionNum  = BatchSize / kRealQueryPerPartition;
-    // Round up: PartitionSize = ceil(DBSize / PartitionNum)
-    const uint64_t PartitionSize = (DBSize + PartitionNum - 1) / PartitionNum;
-
-    config = SimpleBatchPianoPIRConfig{
-            .DBEntryByteNum  = DBEntryByteNum,
-            .DBEntrySize     = DBEntrySize,
-            .DBSize          = DBSize,
-            .BatchSize       = BatchSize,
-            .PartitionNum    = PartitionNum,
-            .PartitionSize   = PartitionSize,
-            .ThreadNum       = kBatchThreadNum,
-            .FailureProbLog2 = FailureProbLog2,
-    };
-
-    subPIR.reserve(PartitionNum);
-    for (uint64_t i = 0; i < PartitionNum; ++i) {
-        uint64_t start = i * PartitionSize;
-        uint64_t end   = std::min((i + 1) * PartitionSize, DBSize);
-        uint64_t partDBSize = end - start;
-
-        // Slice the raw DB for this partition
-        std::vector<uint64_t> partDB(
-                rawDB.begin() + start * DBEntrySize,
-                rawDB.begin() + end   * DBEntrySize);
-
-        subPIR.push_back(std::make_unique<PianoPIR>(
-                partDBSize, DBEntryByteNum, std::move(partDB), FailureProbLog2));
-    }
-}
-
-void SimpleBatchPianoPIR::PrintInfo() const {
-    const double DBSizeInBytes =
-            static_cast<double>(config.DBSize) * static_cast<double>(config.DBEntryByteNum);
-
-    printf("-----------BatchPIR config --------\n");
-    printf("DB size in MB = %.2f\n", DBSizeInBytes / 1024.0 / 1024.0);
-    printf("DBSize: %llu  DBEntryByteNum: %llu  BatchSize: %llu  "
-           "PartitionNum: %llu  PartitionSize: %llu  "
-           "ThreadNum: %llu  FailureProbLog2: %llu\n",
-           (unsigned long long)config.DBSize,
-           (unsigned long long)config.DBEntryByteNum,
-           (unsigned long long)config.BatchSize,
-           (unsigned long long)config.PartitionNum,
-           (unsigned long long)config.PartitionSize,
-           (unsigned long long)config.ThreadNum,
-           (unsigned long long)config.FailureProbLog2);
-
-    const uint64_t maxQuery =
-            subPIR[0]->Config().DBSize > 0
-            ? subPIR[0]->client_MaxQueryNum() / kQueryPerPartition
-            : 0;
-
-    printf("max query num            = %llu\n", (unsigned long long)maxQuery);
-    printf("total storage            = %.2f MB\n", LocalStorageSize() / 1024.0 / 1024.0);
-    printf("comm cost per batch      = %.2f KB\n",
-           static_cast<double>(CommCostPerBatchOnline()) / 1024.0);
-
-    if (maxQuery > 0) {
-        double amortPrep = DBSizeInBytes / static_cast<double>(maxQuery) / 1024.0;
-        printf("amortized prep comm cost = %.2f KB\n", amortPrep);
-        printf("total amortized comm     = %.2f KB\n",
-               amortPrep + static_cast<double>(CommCostPerBatchOnline()) / 1024.0);
-    }
-    printf("-----------------------------\n");
-}
-
-void SimpleBatchPianoPIR::RecordStats(double prepTimeSecs) {
-    preprocessingTime      = prepTimeSecs;
-    localStorage           = static_cast<uint64_t>(LocalStorageSize());
-    commCostPerBatchOnline = CommCostPerBatchOnline();
-    SupportBatchNum         = subPIR[0]->client_MaxQueryNum() / kQueryPerPartition;
-
-    const double DBSizeInBytes =
-            static_cast<double>(config.DBSize) * static_cast<double>(config.DBEntryByteNum);
-    commCostPerBatchOffline =
-            SupportBatchNum > 0
-            ? static_cast<uint64_t>(DBSizeInBytes / static_cast<double>(SupportBatchNum))
-            : 0;
-}
-
-void SimpleBatchPianoPIR::Preprocessing() {
-    PrintInfo();
-
-    FinishedBatchNum       = 0;
-    QueriesMadeInPartition = 0;
-
-    const uint64_t threadNum    = config.ThreadNum;
-    const uint64_t partitionNum = config.PartitionNum;
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    if (threadNum <= 1) {
-        // Single-threaded path (default: kBatchThreadNum = 1)
-        for (uint64_t i = 0; i < partitionNum; ++i) {
-            subPIR[i]->Preprocessing();
-        }
-    } else {
-        // Multi-threaded path: distribute partitions across threads
-        const uint64_t perThread =
-                (partitionNum + threadNum - 1) / threadNum;
-
-        std::vector<std::thread> threads;
-        threads.reserve(threadNum);
-
-        for (uint64_t tid = 0; tid < threadNum; ++tid) {
-            uint64_t start = tid * perThread;
-            uint64_t end   = std::min((tid + 1) * perThread, partitionNum);
-
-            threads.emplace_back([this, start, end]() {
-                for (uint64_t i = start; i < end; ++i) {
-                    subPIR[i]->Preprocessing();
-                }
-            });
-        }
-        for (auto& t : threads) t.join();
-    }
-
-    double elapsed =
-            std::chrono::duration<double>(
-                    std::chrono::high_resolution_clock::now() - t0).count();
-
-    printf("Preprocessing time = %.3f s\n", elapsed);
-    RecordStats(elapsed);
-}
-
-void SimpleBatchPianoPIR::DummyPreprocessing() {
-    PrintInfo();
-    for (uint64_t i = 0; i < config.PartitionNum; ++i) {
-        subPIR[i]->DummyPreprocessing();
-    }
-    printf("Skipping Prep\n");
-    RecordStats(0.0);
-}
-
-std::vector<std::vector<uint64_t>>
-SimpleBatchPianoPIR::Query(const std::vector<uint64_t>& idx) {
-    const uint64_t partitionNum    = config.PartitionNum;
-    const uint64_t partitionSize   = config.PartitionSize;
-    const uint64_t dbEntrySize     = config.DBEntrySize;
-
-    // How many real queries to issue per partition
-    // (same logic as Go: queryNumToMake = len(idx) / PartitionNum)
-    const int queryNumToMake = static_cast<int>(idx.size()) / static_cast<int>(partitionNum);
-
-    // ---- 1. Arrange queries into partitions (first-come-first-served) ----
-    std::vector<std::vector<uint64_t>> partitionQueries(partitionNum);
-    for (uint64_t globalIdx : idx) {
-        uint64_t pId = globalIdx / partitionSize;
-        if (pId >= partitionNum) pId = partitionNum - 1; // clamp last partition
-        partitionQueries[pId].push_back(globalIdx);
-    }
-
-    // ---- 2. Issue queries to each sub-PIR --------------------------------
-    // Map: global index → response entry
-    std::unordered_map<uint64_t, std::vector<uint64_t>> responses;
-    responses.reserve(idx.size());
-
-    for (uint64_t i = 0; i < partitionNum; ++i) {
-        // Pad with sentinel if this partition received fewer than queryNumToMake queries
-        while (static_cast<int>(partitionQueries[i].size()) < queryNumToMake) {
-            partitionQueries[i].push_back(kDefaultValue);
-        }
-
-        // Issue exactly queryNumToMake queries to subPIR[i]
-        for (int j = 0; j < queryNumToMake; ++j) {
-            uint64_t globalIdx = partitionQueries[i][j];
-
-            if (globalIdx == kDefaultValue) {
-                // Dummy cover query — result discarded
-                subPIR[i]->Query(0, false);
-            } else {
-                // Real query: translate global index to partition-local index
-                uint64_t localIdx = globalIdx - i * partitionSize;
-                std::vector<uint64_t> entry = subPIR[i]->Query(localIdx, true);
-                responses[globalIdx] = std::move(entry);
-            }
-        }
-    }
-
-    // ---- 3. Assemble output in original query order ----------------------
-    std::vector<std::vector<uint64_t>> ret(idx.size());
-    for (size_t i = 0; i < idx.size(); ++i) {
-        auto it = responses.find(idx[i]);
-        if (it != responses.end()) {
-            ret[i] = it->second;
-        } else {
-            // Unanswered (partition overflow or dummy): return zero entry
-            ret[i].assign(dbEntrySize, 0);
-        }
-    }
-
-    // ---- 4. Check if sub-PIR needs to be re-preprocessed ----------------
-    // Trigger 2 batches before exhaustion (-2 matches Go's MaxQueryNum-2 guard)
-    const uint64_t maxQ = subPIR[0]->client_MaxQueryNum();
-    if (QueriesMadeInPartition + 2 >= maxQ) {
-        printf("Redo preprocessing. Made %llu batches (%llu queries in partition).\n",
-               (unsigned long long)FinishedBatchNum,
-               (unsigned long long)QueriesMadeInPartition);
-        Preprocessing();
-    } else {
-        const uint64_t batchSize = config.BatchSize;
-        FinishedBatchNum       += idx.size() / batchSize;
-        QueriesMadeInPartition += static_cast<uint64_t>(queryNumToMake);
-    }
-
-    return ret;
-}
-
-double SimpleBatchPianoPIR::LocalStorageSize() const {
-    double total = 0.0;
-    for (const auto& p : subPIR) total += p->LocalStorageSize();
-    return total;
-}
-
-uint64_t SimpleBatchPianoPIR::CommCostPerBatchOnline() const {
-    double total = 0.0;
-    for (const auto& p : subPIR) {
-        total += p->CommCostPerQuery() * static_cast<double>(kQueryPerPartition);
-    }
-    return static_cast<uint64_t>(total);
-}
-***/

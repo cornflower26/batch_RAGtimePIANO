@@ -1,4 +1,3 @@
-
 #ifndef BATCH_PIR_PIANO_PIR_H
 #define BATCH_PIR_PIANO_PIR_H
 
@@ -15,6 +14,7 @@ struct PianoPIRConfig {
     uint64_t SetSize;        // number of chunks (rounded up, multiple of 4)
     uint64_t ThreadNum;      // parallelism hint (currently informational)
     uint64_t FailureProbLog2;
+    double   BudgetMultiplier = 1.0; // H: query budget is H * sqrt(n) * ln n
 };
 
 class PianoPIRServer {
@@ -98,10 +98,12 @@ private:
 class PianoPIR {
 public:
     // Construct from raw DB. DBEntryByteNum must be a multiple of 8.
+    // BudgetMultiplier H scales the query budget per preprocessing (default 1).
     PianoPIR(uint64_t DBSize,
              uint64_t DBEntryByteNum,
              std::vector<uint64_t> rawDB,
-             uint64_t FailureProbLog2 = 40);
+             uint64_t FailureProbLog2 = 40,
+             double BudgetMultiplier = 1.0);
 
     void Preprocessing();
     void DummyPreprocessing(); // skip for benchmarking
@@ -117,6 +119,7 @@ public:
 
     // Accessors into the client (used by SimpleBatchPianoPIR)
     uint64_t client_MaxQueryNum()     const { return client->MaxQueryNum(); }
+    uint64_t client_FinishedQueryNum() const { return client->FinishedQueryNum(); }
     uint64_t client_MaxQueryPerChunk()const { return client->MaxQueryPerChunk(); }
     uint64_t client_PrimaryHintNum() const { return client->PrimaryHintNum();}
     uint64_t client_LocalStorageSize() const {return client->LocalStorageSize();}
@@ -151,7 +154,8 @@ public:
                         uint64_t DBEntryByteNum,
                         uint64_t BatchSize,
                         std::vector<uint64_t> rawDB,
-                        uint64_t FailureProbLog2 = 40);
+                        uint64_t FailureProbLog2 = 40,
+                        double BudgetMultiplier = 1.0);
 
     // Full preprocessing of all partitions (multi-threaded)
     void Preprocessing();
@@ -174,6 +178,7 @@ public:
     double PreprocessingTime()        const { return preprocessingTime; }
 
     uint64_t subPIR_MaxQueryNum(int index) const {return subPIR[index]->client_MaxQueryNum();}
+    uint64_t subPIR_FinishedQueryNum(int index) const {return subPIR[index]->client_FinishedQueryNum();}
     uint64_t subPIR_PrimaryHintNum(int index) const {return subPIR[index]->client_PrimaryHintNum();}
     uint64_t subPIR_LocalStorageSize(int index) const {return subPIR[index]->client_LocalStorageSize();}
 

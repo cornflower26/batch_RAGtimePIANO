@@ -1,3 +1,42 @@
+// PIANO-RAG driver, BATCHED CONTIGUOUS variant: encrypted centroid selection ->
+// SimpleBatchPianoPIR over embeddings -> local FAISS re-rank -> Piano PIR over text.
+//
+// Identical to main.cpp (same flags, output format, truncation, refresh and
+// cost reporting) except for PIR 1, which uses SimpleBatchPianoPIR on the
+// database in its ORIGINAL order (no rearranging of documents by centroid;
+// that is batch_main.cpp's --spread-clusters):
+//   * --batch-size B (default 32, even): the embedding DB is split into B/2
+//     contiguous partitions and each batch sends 2 queries to every partition.
+//     Candidates are packed into batches of at most 2 per partition (what
+//     makeOptimizedBatchesContiguous did), so none are left unanswered.
+//   * --min-batches N (default 0): pad every query to at least N batches with
+//     dummy batches, so the batch count doesn't depend on the query.
+//
+// Changes vs. the original main:
+//   * Embeddings are stored as float32, two per uint64_t (3072 B/entry instead of
+//     6144), and every staging copy of a database is released as soon as it is
+//     packed. The packed DBs are moved (not copied) into PianoPIR.
+//   * Optional --embedding-bin: stream a raw float32 file instead of parsing JSON.
+//   * Piano query budget (total and per-chunk) is tracked; when it would be
+//     exceeded the client re-runs preprocessing and logs a "[refresh]" line.
+//     Nothing is silently dropped any more.
+//   * --query-list runs many queries in one process with setup done once.
+//   * --work-dir isolates each process's keys / ciphertexts / top-k file, so
+//     parallel runs no longer clobber each other. Stale top-k files are removed
+//     before every query.
+//   * Local CKKS path: centroids loaded once, each batch decrypted inside the
+//     loop (no vector of thousands of ciphertexts), slot count checked,
+//     nested OpenMP disabled, thread count configurable.
+//   * Cost/timing reports use the number of queries actually issued, and the
+//     centroid step is reported as per-query work.
+//   * Input validation, stricter --mac parsing, and a top-level try/catch.
+//   * PIR setup (server build, client preprocessing, refreshes) is timed per
+//     PIR, and online plus offline communication is tracked per query and in
+//     run totals.
+//   * Auto truncation: if the database files hold more entries than --db-size,
+//     only the first --db-size entries are packed into the PIR databases, and
+//     the effect on the centroid lists is reported.
+
 #include "piano_pir.h"
 
 #include <algorithm>
@@ -298,6 +337,194 @@ namespace {
         return v;
     }
 
+    // ------------------------------------------------- Embedding precision --
+
+    // Stage One entries can be stored as fp32 (2 values per word, 3,072 B per
+    // entry), fp16 (4 per word, 1,536 B) or int8 (8 per word, 768 B, symmetric
+    // per-dimension scales computed from the database; the scales are public
+    // parameters the client keeps). Smaller entries shrink restreaming, online
+    // download and hint storage in proportion; re-ranking uses the decoded values.
+    uint16_t FloatToHalf(float f) {
+        const uint32_t x = std::bit_cast<uint32_t>(f);
+        const uint32_t sign = (x >> 16) & 0x8000u;
+        const uint32_t expBits = (x >> 23) & 0xffu;
+        uint32_t mant = x & 0x7fffffu;
+        if (expBits == 0xffu) return static_cast<uint16_t>(sign | 0x7c00u | (mant ? 0x200u : 0u));  // inf / nan
+        const int32_t exp = static_cast<int32_t>(expBits) - 127 + 15;
+        if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);                                 // overflow
+        if (exp <= 0) {                                                                              // subnormal
+            if (exp < -10) return static_cast<uint16_t>(sign);
+            mant |= 0x800000u;
+            const uint32_t shift = static_cast<uint32_t>(14 - exp);
+            uint32_t half = mant >> shift;
+            const uint32_t rem = mant & ((1u << shift) - 1u), halfway = 1u << (shift - 1u);
+            if (rem > halfway || (rem == halfway && (half & 1u))) ++half;
+            return static_cast<uint16_t>(sign | half);
+        }
+        uint32_t half = sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+        const uint32_t rem = mant & 0x1fffu;
+        if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) ++half;  // round to nearest even
+        return static_cast<uint16_t>(half);
+    }
+
+    float HalfToFloat(uint16_t h) {
+        const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+        const uint32_t exp = (h >> 10) & 0x1fu;
+        uint32_t mant = h & 0x3ffu;
+        uint32_t x;
+        if (exp == 0) {
+            if (mant == 0) {
+                x = sign;
+            } else {  // subnormal: normalise
+                int32_t e = -14;
+                while (!(mant & 0x400u)) {
+                    mant <<= 1;
+                    --e;
+                }
+                mant &= 0x3ffu;
+                x = sign | (static_cast<uint32_t>(e + 127) << 23) | (mant << 13);
+            }
+        } else if (exp == 31) {
+            x = sign | 0x7f800000u | (mant << 13);
+        } else {
+            x = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+        return std::bit_cast<float>(x);
+    }
+
+    struct EmbeddingCodec {
+        std::string name = "fp32";
+        uint64_t perWord = 2;              // values per 64-bit word
+        uint64_t words = kEmbeddingWords;  // words per entry
+        std::vector<float> scale;          // int8 only: one scale per dimension
+
+        uint64_t EntryBytes() const { return words * 8; }
+
+        static EmbeddingCodec Make(const std::string &name) {
+            EmbeddingCodec c;
+            c.name = name;
+            if (name == "fp32") {
+                c.perWord = 2;
+            } else if (name == "fp16") {
+                c.perWord = 4;
+            } else if (name == "int8") {
+                c.perWord = 8;
+            } else {
+                throw std::invalid_argument("--embedding-precision must be fp32, fp16 or int8");
+            }
+            c.words = kEmbeddingDim / c.perWord;
+            return c;
+        }
+
+        static void DecodeFp32(const uint64_t *w, float *v) {
+            for (uint64_t i = 0; i < kEmbeddingWords; ++i) {
+                v[2 * i] = std::bit_cast<float>(static_cast<uint32_t>(w[i]));
+                v[2 * i + 1] = std::bit_cast<float>(static_cast<uint32_t>(w[i] >> 32));
+            }
+        }
+
+        void EncodeRow(const float *v, uint64_t *w) const {
+            if (name == "fp32") {
+                PackEmbeddingRow(v, w);
+                return;
+            }
+            for (uint64_t i = 0; i < words; ++i) {
+                uint64_t word = 0;
+                for (uint64_t j = 0; j < perWord; ++j) {
+                    const uint64_t d = i * perWord + j;
+                    uint64_t bits;
+                    if (name == "fp16") {
+                        bits = FloatToHalf(v[d]);
+                    } else {
+                        const float q = std::round(v[d] / scale[d]);
+                        bits = static_cast<uint8_t>(static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f)));
+                    }
+                    word |= bits << ((64 / perWord) * j);
+                }
+                w[i] = word;
+            }
+        }
+
+        std::vector<float> Decode(const uint64_t *w) const {
+            std::vector<float> v(kEmbeddingDim);
+            if (name == "fp32") {
+                DecodeFp32(w, v.data());
+                return v;
+            }
+            const uint64_t bitsPer = 64 / perWord;
+            for (uint64_t i = 0; i < words; ++i) {
+                for (uint64_t j = 0; j < perWord; ++j) {
+                    const uint64_t d = i * perWord + j;
+                    if (name == "fp16") {
+                        v[d] = HalfToFloat(static_cast<uint16_t>(w[i] >> (bitsPer * j)));
+                    } else {
+                        v[d] = static_cast<float>(static_cast<int8_t>(static_cast<uint8_t>(w[i] >> (bitsPer * j)))) *
+                               scale[d];
+                    }
+                }
+            }
+            return v;
+        }
+
+        std::vector<float> Decode(const std::vector<uint64_t> &w) const {
+            if (w.size() != words) {
+                throw std::runtime_error("Stage One response has " + std::to_string(w.size()) + " words, expected " +
+                                         std::to_string(words) + " (" + name + ")");
+            }
+            return Decode(w.data());
+        }
+
+        // Re-encodes a packed fp32 database (rows x kEmbeddingWords) in this precision.
+        std::vector<uint64_t> Encode(std::vector<uint64_t> fp32, uint64_t rows) {
+            if (name == "fp32") return fp32;
+            std::vector<float> v(kEmbeddingDim);
+            if (name == "int8") {
+                scale.assign(kEmbeddingDim, 0.0f);
+                for (uint64_t r = 0; r < rows; ++r) {
+                    DecodeFp32(&fp32[r * kEmbeddingWords], v.data());
+                    for (uint64_t d = 0; d < kEmbeddingDim; ++d) scale[d] = std::max(scale[d], std::fabs(v[d]));
+                }
+                for (float &s: scale) s = s > 0.0f ? s / 127.0f : 1.0f;
+            }
+            std::vector<uint64_t> out(rows * words, 0);
+            for (uint64_t r = 0; r < rows; ++r) {
+                DecodeFp32(&fp32[r * kEmbeddingWords], v.data());
+                EncodeRow(v.data(), &out[r * words]);
+            }
+            return out;  // the fp32 copy is freed when `fp32` goes out of scope
+        }
+    };
+
+    EmbeddingCodec g_codec;  // Stage One entry format; set once at startup
+
+    // ------------------------------------------------ Chunk-balanced layout --
+
+    // Piano's chunk size for an n-entry database, computed exactly as PianoPIR does.
+    uint64_t PianoChunkSize(uint64_t n) {
+        const auto target = static_cast<uint64_t>(2.0 * std::sqrt(static_cast<double>(n)));
+        uint64_t s = 1;
+        while (s < target) s *= 2;
+        return s;
+    }
+
+    // Offsets 0..n-1 ordered to visit Piano's chunks round-robin, so documents
+    // placed one after another land in different chunks. Each chunk has backups
+    // for only about 3x its average share of queries, so spreading every IVF list
+    // across chunks keeps one chunk from running out long before the total budget
+    // (which would force an early refresh whose timing depends on the data).
+    std::vector<uint64_t> ChunkInterleave(uint64_t n, uint64_t s) {
+        std::vector<uint64_t> order;
+        order.reserve(n);
+        const uint64_t chunks = (n + s - 1) / s;
+        for (uint64_t r = 0; r < s; ++r) {
+            for (uint64_t c = 0; c < chunks; ++c) {
+                const uint64_t off = c * s + r;
+                if (off < n) order.push_back(off);
+            }
+        }
+        return order;
+    }
+
     // Raw little-endian float32 file, row-major, kEmbeddingDim floats per row.
     // Only the first dbSize rows are read, so a larger file costs no extra memory.
     PackedDB LoadEmbeddingRawDBFromBinary(const std::string &path, uint64_t dbSize) {
@@ -387,11 +614,17 @@ namespace {
     class BudgetedPianoPIR {
     public:
         // Construction builds the server-side database; it is timed as "server setup".
+        // budgetMult (H) scales Piano's query budget. realAccounting counts only
+        // queries that consume a hint (Piano's own count: dummy queries and cache
+        // hits are free) instead of every query issued. Issued accounting gives a
+        // data-independent refresh schedule; real accounting refreshes less often
+        // but its timing reveals how many queries were dummies or cache hits.
         BudgetedPianoPIR(std::string name, uint64_t dbSize, uint64_t entryBytes,
-                         std::vector<uint64_t> rawDB, uint64_t failProbLog2)
-                : name_(std::move(name)) {
+                         std::vector<uint64_t> rawDB, uint64_t failProbLog2,
+                         double budgetMult = 1.0, bool realAccounting = false)
+                : name_(std::move(name)), realAccounting_(realAccounting) {
             const auto start = Clock::now();
-            pir_ = std::make_unique<PianoPIR>(dbSize, entryBytes, std::move(rawDB), failProbLog2);
+            pir_ = std::make_unique<PianoPIR>(dbSize, entryBytes, std::move(rawDB), failProbLog2, budgetMult);
             serverSetupSeconds_ = SecondsSince(start);
             std::cout << name_ << " server setup time " << serverSetupSeconds_ << " s" << std::endl;
         }
@@ -411,18 +644,34 @@ namespace {
             if (!prepared_) {
                 throw std::logic_error(name_ + ": Query() called before Preprocess()");
             }
-            if (usedSinceRefresh_ >= maxQueryNum_) {
+            const uint64_t used = realAccounting_ ? pir_->client_FinishedQueryNum() : usedSinceRefresh_;
+            if (used >= maxQueryNum_) {
                 Refresh("total query budget reached");
             } else if (realQuery && chunkUsed_[ChunkOf(idx)] >= maxPerChunk_) {
+                // Avoids Piano's "too many queries in chunk" error, but the timing of
+                // this refresh depends on which documents were queried; counted
+                // separately so experiments show whether it ever happens.
+                ++chunkRefreshCount_;
+                std::cerr << "warning: " << name_ << " refreshing early because chunk " << ChunkOf(idx)
+                          << " ran out of backup hints; this refresh's timing depends on the queried documents"
+                          << std::endl;
                 Refresh("per-chunk budget reached for chunk " + std::to_string(ChunkOf(idx)));
             }
+            const uint64_t finishedBefore = pir_->client_FinishedQueryNum();
             std::vector<uint64_t> result = pir_->Query(idx, realQuery);
+            const uint64_t consumed = pir_->client_FinishedQueryNum() - finishedBefore;  // 0: dummy or cache hit
             ++usedSinceRefresh_;
             onlineUploadBytes_ += pir_->UploadCostPerQuery();
             onlineDownloadBytes_ += pir_->DownloadCostPerQuery();
+            // Each budget unit used is charged 1/Q of the N*B restream that buys the
+            // budget, so the cost shows even if no refresh happens yet.
+            const double charged = realAccounting_ ? static_cast<double>(consumed) : 1.0;
+            amortizedRestreamBytes_ += charged * OfflineBytesPerPreprocessing() / static_cast<double>(maxQueryNum_);
             if (realQuery) {
-                ++chunkUsed_[ChunkOf(idx)];
+                // Per-chunk use always follows Piano's own count (cache hits use no backup).
+                if (consumed > 0) ++chunkUsed_[ChunkOf(idx)];
                 ++realIssued_;
+                if (consumed == 0) ++cacheHits_;
             } else {
                 ++dummyIssued_;
             }
@@ -440,11 +689,12 @@ namespace {
         struct Totals {
             double onlineUploadBytes = 0, onlineDownloadBytes = 0, refreshOfflineBytes = 0, refreshSeconds = 0;
             uint64_t queries = 0, refreshes = 0;
+            double amortizedRestreamBytes = 0;
         };
 
         Totals Snapshot() const {
             return {onlineUploadBytes_, onlineDownloadBytes_, refreshOfflineBytes_, refreshSeconds_,
-                    realIssued_ + dummyIssued_, refreshCount_};
+                    realIssued_ + dummyIssued_, refreshCount_, amortizedRestreamBytes_};
         }
 
         // Prints this PIR's online and refresh costs since `before`.
@@ -453,6 +703,8 @@ namespace {
             // Raw numbers kept on their own lines so existing log parsers still work.
             std::cout << label << " Upload " << std::llround(now.onlineUploadBytes - before.onlineUploadBytes) << std::endl;
             std::cout << label << " Download " << std::llround(now.onlineDownloadBytes - before.onlineDownloadBytes) << std::endl;
+            std::cout << label << " amortized restream "
+                      << std::llround(now.amortizedRestreamBytes - before.amortizedRestreamBytes) << std::endl;
             std::cout << label << " queries " << now.queries - before.queries << ", online "
                       << FormatBytes(now.onlineUploadBytes - before.onlineUploadBytes) << " up / "
                       << FormatBytes(now.onlineDownloadBytes - before.onlineDownloadBytes) << " down";
@@ -470,11 +722,16 @@ namespace {
                       << "  setup time:          server " << serverSetupSeconds_ << " s, client preprocessing "
                       << initialPrepSeconds_ << " s\n"
                       << "  queries:             " << realIssued_ << " real + " << dummyIssued_ << " dummy\n"
-                      << "  refreshes:           " << refreshCount_ << " (" << refreshSeconds_ << " s)\n"
+                      << "  refreshes:           " << refreshCount_ << " (" << refreshSeconds_ << " s), "
+                      << chunkRefreshCount_ << " triggered by one chunk running out\n"
+                      << "  budget accounting:   " << (realAccounting_ ? "real (hint-consuming queries only)" : "issued (every query)")
+                      << ", " << cacheHits_ << " cache hits\n"
                       << "  online upload:       " << FormatBytes(onlineUploadBytes_) << "\n"
                       << "  online download:     " << FormatBytes(onlineDownloadBytes_) << "\n"
                       << "  offline (initial):   " << FormatBytes(initialOfflineBytes_) << "\n"
                       << "  offline (refreshes): " << FormatBytes(refreshOfflineBytes_) << "\n"
+                      << "  amortized restream:  " << FormatBytes(amortizedRestreamBytes_) << " (budget used "
+                      << amortizedRestreamBytes_ / OfflineBytesPerPreprocessing() << " preprocessings)\n"
                       << "  total communication: "
                       << FormatBytes(onlineUploadBytes_ + onlineDownloadBytes_ + offlineTotal) << "\n"
                       << "  client storage:      "
@@ -569,6 +826,10 @@ namespace {
         double refreshOfflineBytes_ = 0.0;
         double onlineUploadBytes_ = 0.0;
         double onlineDownloadBytes_ = 0.0;
+        double amortizedRestreamBytes_ = 0.0;
+        bool realAccounting_ = false;
+        uint64_t chunkRefreshCount_ = 0;
+        uint64_t cacheHits_ = 0;
         uint64_t realIssued_ = 0;
         uint64_t dummyIssued_ = 0;
     };
@@ -584,11 +845,11 @@ namespace {
     class BatchedEmbeddingPIR {
     public:
         BatchedEmbeddingPIR(std::string name, uint64_t dbSize, uint64_t entryBytes, uint64_t batchSize,
-                            std::vector<uint64_t> rawDB, uint64_t failProbLog2)
+                            std::vector<uint64_t> rawDB, uint64_t failProbLog2, double budgetMult = 1.0)
                 : name_(std::move(name)), dbSize_(dbSize), entryBytes_(entryBytes), batchSize_(batchSize) {
             const auto start = Clock::now();
             pir_ = std::make_unique<SimpleBatchPianoPIR>(dbSize, entryBytes, batchSize, std::move(rawDB),
-                                                         failProbLog2);
+                                                         failProbLog2, budgetMult);
             serverSetupSeconds_ = SecondsSince(start);
             partitionNum_ = pir_->Config().PartitionNum;
             partitionSize_ = pir_->Config().PartitionSize;
@@ -637,6 +898,8 @@ namespace {
             }
             onlineUploadBytes_ += static_cast<double>(pir_->UploadCostPerBatchOnline());
             onlineDownloadBytes_ += static_cast<double>(pir_->DownloadCostPerBatchOnline());
+            // One restream (N*B bytes) covers BatchesPerPreprocessing() batches.
+            amortizedRestreamBytes_ += OfflineBytesPerPreprocessing() / static_cast<double>(BatchesPerPreprocessing());
             ++batches_;
             return result;
         }
@@ -651,17 +914,20 @@ namespace {
         struct Totals {
             double onlineUploadBytes = 0, onlineDownloadBytes = 0, refreshOfflineBytes = 0, refreshSeconds = 0;
             uint64_t batches = 0, refreshes = 0;
+            double amortizedRestreamBytes = 0;
         };
 
         Totals Snapshot() const {
             return {onlineUploadBytes_, onlineDownloadBytes_, refreshOfflineBytes_, refreshSeconds_, batches_,
-                    refreshCount_};
+                    refreshCount_, amortizedRestreamBytes_};
         }
 
         void PrintQueryCosts(const std::string &label, const Totals &before) const {
             const Totals now = Snapshot();
             std::cout << label << " Upload " << std::llround(now.onlineUploadBytes - before.onlineUploadBytes) << std::endl;
             std::cout << label << " Download " << std::llround(now.onlineDownloadBytes - before.onlineDownloadBytes) << std::endl;
+            std::cout << label << " amortized restream "
+                      << std::llround(now.amortizedRestreamBytes - before.amortizedRestreamBytes) << std::endl;
             std::cout << label << " batches " << now.batches - before.batches << " (batch size " << batchSize_
                       << "), online " << BudgetedPianoPIR::FormatBytes(now.onlineUploadBytes - before.onlineUploadBytes)
                       << " up / " << BudgetedPianoPIR::FormatBytes(now.onlineDownloadBytes - before.onlineDownloadBytes)
@@ -686,6 +952,7 @@ namespace {
                       << "  online download:     " << BudgetedPianoPIR::FormatBytes(onlineDownloadBytes_) << "\n"
                       << "  offline (initial):   " << BudgetedPianoPIR::FormatBytes(initialOfflineBytes_) << "\n"
                       << "  offline (refreshes): " << BudgetedPianoPIR::FormatBytes(refreshOfflineBytes_) << "\n"
+                      << "  amortized restream:  " << BudgetedPianoPIR::FormatBytes(amortizedRestreamBytes_) << "\n"
                       << "  total communication: "
                       << BudgetedPianoPIR::FormatBytes(onlineUploadBytes_ + onlineDownloadBytes_ + offlineTotal) << "\n"
                       << "  client storage:      " << BudgetedPianoPIR::FormatBytes(pir_->LocalStorageSize())
@@ -757,6 +1024,7 @@ namespace {
         double onlineUploadBytes_ = 0.0;
         double onlineDownloadBytes_ = 0.0;
         uint64_t batches_ = 0;
+        double amortizedRestreamBytes_ = 0.0;
     };
 
     struct BatchRetrieval {
@@ -814,7 +1082,7 @@ namespace {
                     if (empty) {
                         retry.push_back(batch[i]);
                     } else {
-                        out.vectors.push_back(UnpackEmbeddingRow(a));
+                        out.vectors.push_back(g_codec.Decode(a));
                         out.docIds.push_back(batch[i]);
                     }
                 }
@@ -864,7 +1132,7 @@ namespace {
         const uint32_t slots = s.cc->GetRingDimension() / 2;
         if (slots < static_cast<uint32_t>(kSlotsUsed)) {
             throw std::runtime_error("CKKS context has " + std::to_string(slots) + " slots but the centroid "
-                                                                                   "packing needs " + std::to_string(kSlotsUsed) +
+                                     "packing needs " + std::to_string(kSlotsUsed) +
                                      " (ring dimension >= " + std::to_string(2 * kSlotsUsed) + ")");
         }
 
@@ -1089,6 +1357,22 @@ namespace {
         const unsigned hw = std::thread::hardware_concurrency();
         const int numThreads = GetPositiveIntOpt(opts, "--threads", hw > 0 ? static_cast<int>(hw) : 1);
         const bool printDocs = GetBoolOpt(opts, "--print-docs", false);
+        // --budget-mult H: Stage One query budget per preprocessing is H * sqrt(n) * ln n.
+        const double budgetMult = std::stod(GetOpt(opts, "--budget-mult", "1"));
+        if (!(budgetMult > 0.0)) {
+            throw std::invalid_argument("--budget-mult must be positive");
+        }
+        // --budget-accounting issued|real (see BudgetedPianoPIR).
+        const std::string accountingMode = GetOpt(opts, "--budget-accounting", "issued");
+        if (accountingMode != "issued" && accountingMode != "real") {
+            throw std::invalid_argument("--budget-accounting must be issued or real");
+        }
+        const bool realAccounting = accountingMode == "real";
+        // --embedding-precision fp32|fp16|int8: Stage One entry format (fp32 = 3,072 B).
+        const std::string precision = GetOpt(opts, "--embedding-precision", "fp32");
+        g_codec = EmbeddingCodec::Make(precision);
+        // --chunk-spread: lay each IVF list across Piano's chunks (see ChunkInterleave).
+        const bool chunkSpread = GetBoolOpt(opts, "--chunk-spread", false);
         const uint64_t batchSize = GetPositiveU64Opt(opts, "--batch-size", 32);
         const uint64_t minBatches = GetOpt(opts, "--min-batches", "0") == "0"
                                     ? 0 : GetPositiveU64Opt(opts, "--min-batches", 0);
@@ -1108,22 +1392,29 @@ namespace {
         }
 
         const std::string embeddingDbPath = GetOpt(opts, "--embedding-db", mac
-                                                                           ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/faiss.json"
-                                                                           : "/home/ajanusze/PIANO-RAG/faiss.json");
+                ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/faiss.json"
+                : "/home/ajanusze/PIANO-RAG/faiss.json");
         // Optional raw float32 file (dbSize x 768). Avoids the JSON parse entirely.
         const std::string embeddingBinPath = GetOpt(opts, "--embedding-bin", "");
         const std::string centroidMappingPath = GetOpt(opts, "--centroid-mapping", mac
-                                                                                   ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/lists.json"
-                                                                                   : "../lists.json");
+                ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/lists.json"
+                : "../lists.json");
         const std::string textDbPath = GetOpt(opts, "--text-db", mac
-                                                                 ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index.txt"
-                                                                 : "/home/ajanusze/PIANO-RAG/uniform_index_1024.txt");
+                ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index.txt"
+                : "/home/ajanusze/PIANO-RAG/uniform_index_1024.txt");
 
         std::cout << "Config: db-size " << dbSize << ", queries " << queryPaths.size() << ", top-k " << topK
                   << ", centroid-top-k " << centroidTopK << ", threads " << numThreads
                   << ", work-dir " << workDir << (mac ? ", local centroid path" : ", server centroid path")
                   << ", PIR 1 batched: batch size " << batchSize << ", " << partitionNum << " partitions of "
-                  << partitionSize << " (contiguous), min-batches " << minBatches << std::endl;
+                  << partitionSize << " (contiguous), min-batches " << minBatches
+                  << ", budget multiplier " << budgetMult << ", budget accounting " << accountingMode
+                  << " (Stage Two only; Stage One batches count every slot)"
+                  << ", embedding precision " << precision << ", chunk spread off" << std::endl;
+        if (chunkSpread) {
+            std::cerr << "warning: --chunk-spread is not available in the contiguous build (it keeps the original order)"
+                      << std::endl;
+        }
 
         // ------------------------------------------------ One-time setup --
         const auto oneTimeStart = Clock::now();
@@ -1151,12 +1442,21 @@ namespace {
         std::cout << "Database for this run: " << dbSize << " of " << sourceEntries << " entries" << std::endl;
         ReportMappingCoverage(centroidToIndex, dbSize, sourceEntries);
 
+        // Stage One entry format (--embedding-precision).
+        if (g_codec.name != "fp32") {
+            const auto encStart = Clock::now();
+            embeddingDb.raw = g_codec.Encode(std::move(embeddingDb.raw), dbSize);
+            std::cout << "Stage One entries: " << g_codec.name << ", " << g_codec.EntryBytes() << " B per entry (encoded in "
+                      << SecondsSince(encStart) << " s)" << std::endl;
+        }
+
         std::cout << "Server and Client One-time Setup" << std::endl;
         // Moved in. Note: SimpleBatchPianoPIR copies each partition out of the
         // DB it is given, so PIR 1 briefly needs two copies during construction.
-        BatchedEmbeddingPIR embeddingPir("PIR 1 (batched contiguous embeddings)", dbSize, kEmbeddingEntryBytes, batchSize,
-                                         std::move(embeddingDb.raw), failProbLog2);
-        BudgetedPianoPIR textPir("PIR 2 (text)", dbSize, kTextEntryBytes, std::move(textDb.raw), failProbLog2);
+        BatchedEmbeddingPIR embeddingPir("PIR 1 (batched contiguous embeddings)", dbSize, g_codec.EntryBytes(), batchSize,
+                                         std::move(embeddingDb.raw), failProbLog2, budgetMult);
+        BudgetedPianoPIR textPir("PIR 2 (text)", dbSize, kTextEntryBytes, std::move(textDb.raw), failProbLog2,
+                                 1.0, realAccounting);
         std::cout << "Server Setup time: " << embeddingPir.ServerSetupSeconds() + textPir.ServerSetupSeconds()
                   << std::endl;
 
@@ -1276,7 +1576,8 @@ namespace {
             std::vector<std::string> retrievedDocs;
             retrievedDocs.reserve(results.size());
             for (const auto &r: results) {
-                retrievedDocs.push_back(UnpackTextEntry(textPir.Query(r.first, /*realQuery=*/true)));
+                const uint64_t textPos = r.first;
+                retrievedDocs.push_back(UnpackTextEntry(textPir.Query(textPos, /*realQuery=*/true)));
                 if (printDocs) {
                     std::cout << "[" << r.first << "] " << retrievedDocs.back() << std::endl;
                 }

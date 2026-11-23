@@ -60,12 +60,23 @@ target_link_libraries(pianopir PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 # ---- Executable -------------------------------------------------------------
 add_executable(batch_pir regular_test.cpp)
 add_executable(main main.cpp)
+add_executable(doublepir_main main_doublepir.cpp)
 add_executable(regular_batch_main regular_batched.cpp)
 add_executable(partition_batch_main partition_batched.cpp)
 target_link_libraries(main PRIVATE pianopir)
+target_link_libraries(doublepir_main PRIVATE pianopir)
 target_link_libraries(regular_batch_main PRIVATE pianopir)
 target_link_libraries(batch_pir PRIVATE pianopir)
 target_link_libraries(partition_batch_main PRIVATE pianopir)
+
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-march=native" DPIR_HAS_MARCH_NATIVE)
+if(DPIR_HAS_MARCH_NATIVE AND NOT APPLE)
+    set(DPIR_ARCH_FLAGS -march=native)          # Linux experiment hosts: AVX2 + AES-NI
+else()
+    set(DPIR_ARCH_FLAGS "")                      # macOS: -O3 only (Rosetta has no AVX2)
+endif()
+target_compile_options(doublepir_main PRIVATE -O3 ${DPIR_ARCH_FLAGS})
 
 add_library(openfhecorelib SHARED IMPORTED)
 add_library(openfhepkelib SHARED IMPORTED)
