@@ -298,6 +298,310 @@ namespace {
         return v;
     }
 
+    // ------------------------------------------------- Embedding precision --
+
+    // Stage One entries can be stored as fp32 (2 values per word, 3,072 B per
+    // entry), fp16 (4 per word, 1,536 B) or int8 (8 per word, 768 B, symmetric
+    // per-dimension scales computed from the database; the scales are public
+    // parameters the client keeps). Smaller entries shrink restreaming, online
+    // download and hint storage in proportion; re-ranking uses the decoded values.
+    uint16_t FloatToHalf(float f) {
+        const uint32_t x = std::bit_cast<uint32_t>(f);
+        const uint32_t sign = (x >> 16) & 0x8000u;
+        const uint32_t expBits = (x >> 23) & 0xffu;
+        uint32_t mant = x & 0x7fffffu;
+        if (expBits == 0xffu) return static_cast<uint16_t>(sign | 0x7c00u | (mant ? 0x200u : 0u));  // inf / nan
+        const int32_t exp = static_cast<int32_t>(expBits) - 127 + 15;
+        if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);                                 // overflow
+        if (exp <= 0) {                                                                              // subnormal
+            if (exp < -10) return static_cast<uint16_t>(sign);
+            mant |= 0x800000u;
+            const uint32_t shift = static_cast<uint32_t>(14 - exp);
+            uint32_t half = mant >> shift;
+            const uint32_t rem = mant & ((1u << shift) - 1u), halfway = 1u << (shift - 1u);
+            if (rem > halfway || (rem == halfway && (half & 1u))) ++half;
+            return static_cast<uint16_t>(sign | half);
+        }
+        uint32_t half = sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+        const uint32_t rem = mant & 0x1fffu;
+        if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) ++half;  // round to nearest even
+        return static_cast<uint16_t>(half);
+    }
+
+    float HalfToFloat(uint16_t h) {
+        const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+        const uint32_t exp = (h >> 10) & 0x1fu;
+        uint32_t mant = h & 0x3ffu;
+        uint32_t x;
+        if (exp == 0) {
+            if (mant == 0) {
+                x = sign;
+            } else {  // subnormal: normalise
+                int32_t e = -14;
+                while (!(mant & 0x400u)) {
+                    mant <<= 1;
+                    --e;
+                }
+                mant &= 0x3ffu;
+                x = sign | (static_cast<uint32_t>(e + 127) << 23) | (mant << 13);
+            }
+        } else if (exp == 31) {
+            x = sign | 0x7f800000u | (mant << 13);
+        } else {
+            x = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+        return std::bit_cast<float>(x);
+    }
+
+    struct EmbeddingCodec {
+        std::string name = "fp32";
+        uint64_t perWord = 2;              // values per 64-bit word
+        uint64_t words = kEmbeddingWords;  // words per entry
+        std::vector<float> scale;          // int8 only: one scale per dimension
+
+        uint64_t EntryBytes() const { return words * 8; }
+
+        static EmbeddingCodec Make(const std::string &name) {
+            EmbeddingCodec c;
+            c.name = name;
+            if (name == "fp32") {
+                c.perWord = 2;
+            } else if (name == "fp16") {
+                c.perWord = 4;
+            } else if (name == "int8") {
+                c.perWord = 8;
+            } else {
+                throw std::invalid_argument("--embedding-precision must be fp32, fp16 or int8");
+            }
+            c.words = kEmbeddingDim / c.perWord;
+            return c;
+        }
+
+        static void DecodeFp32(const uint64_t *w, float *v) {
+            for (uint64_t i = 0; i < kEmbeddingWords; ++i) {
+                v[2 * i] = std::bit_cast<float>(static_cast<uint32_t>(w[i]));
+                v[2 * i + 1] = std::bit_cast<float>(static_cast<uint32_t>(w[i] >> 32));
+            }
+        }
+
+        void EncodeRow(const float *v, uint64_t *w) const {
+            if (name == "fp32") {
+                PackEmbeddingRow(v, w);
+                return;
+            }
+            for (uint64_t i = 0; i < words; ++i) {
+                uint64_t word = 0;
+                for (uint64_t j = 0; j < perWord; ++j) {
+                    const uint64_t d = i * perWord + j;
+                    uint64_t bits;
+                    if (name == "fp16") {
+                        bits = FloatToHalf(v[d]);
+                    } else {
+                        const float q = std::round(v[d] / scale[d]);
+                        bits = static_cast<uint8_t>(static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f)));
+                    }
+                    word |= bits << ((64 / perWord) * j);
+                }
+                w[i] = word;
+            }
+        }
+
+        std::vector<float> Decode(const uint64_t *w) const {
+            std::vector<float> v(kEmbeddingDim);
+            if (name == "fp32") {
+                DecodeFp32(w, v.data());
+                return v;
+            }
+            const uint64_t bitsPer = 64 / perWord;
+            for (uint64_t i = 0; i < words; ++i) {
+                for (uint64_t j = 0; j < perWord; ++j) {
+                    const uint64_t d = i * perWord + j;
+                    if (name == "fp16") {
+                        v[d] = HalfToFloat(static_cast<uint16_t>(w[i] >> (bitsPer * j)));
+                    } else {
+                        v[d] = static_cast<float>(static_cast<int8_t>(static_cast<uint8_t>(w[i] >> (bitsPer * j)))) *
+                               scale[d];
+                    }
+                }
+            }
+            return v;
+        }
+
+        std::vector<float> Decode(const std::vector<uint64_t> &w) const {
+            if (w.size() != words) {
+                throw std::runtime_error("Stage One response has " + std::to_string(w.size()) + " words, expected " +
+                                         std::to_string(words) + " (" + name + ")");
+            }
+            return Decode(w.data());
+        }
+
+        // Re-encodes a packed fp32 database (rows x kEmbeddingWords) in this precision.
+        std::vector<uint64_t> Encode(std::vector<uint64_t> fp32, uint64_t rows) {
+            if (name == "fp32") return fp32;
+            std::vector<float> v(kEmbeddingDim);
+            if (name == "int8") {
+                scale.assign(kEmbeddingDim, 0.0f);
+                for (uint64_t r = 0; r < rows; ++r) {
+                    DecodeFp32(&fp32[r * kEmbeddingWords], v.data());
+                    for (uint64_t d = 0; d < kEmbeddingDim; ++d) scale[d] = std::max(scale[d], std::fabs(v[d]));
+                }
+                for (float &s: scale) s = s > 0.0f ? s / 127.0f : 1.0f;
+            }
+            std::vector<uint64_t> out(rows * words, 0);
+            for (uint64_t r = 0; r < rows; ++r) {
+                DecodeFp32(&fp32[r * kEmbeddingWords], v.data());
+                EncodeRow(v.data(), &out[r * words]);
+            }
+            return out;  // the fp32 copy is freed when `fp32` goes out of scope
+        }
+    };
+
+    EmbeddingCodec g_codec;  // Stage One entry format; set once at startup
+
+    // ------------------------------------------------ Chunk-balanced layout --
+
+    // Piano's chunk size for an n-entry database, computed exactly as PianoPIR does.
+    uint64_t PianoChunkSize(uint64_t n) {
+        const auto target = static_cast<uint64_t>(2.0 * std::sqrt(static_cast<double>(n)));
+        uint64_t s = 1;
+        while (s < target) s *= 2;
+        return s;
+    }
+
+    // Offsets 0..n-1 ordered to visit Piano's chunks round-robin, so documents
+    // placed one after another land in different chunks. Each chunk has backups
+    // for only about 3x its average share of queries, so spreading every IVF list
+    // across chunks keeps one chunk from running out long before the total budget
+    // (which would force an early refresh whose timing depends on the data).
+    std::vector<uint64_t> ChunkInterleave(uint64_t n, uint64_t s) {
+        std::vector<uint64_t> order;
+        order.reserve(n);
+        const uint64_t chunks = (n + s - 1) / s;
+        for (uint64_t r = 0; r < s; ++r) {
+            for (uint64_t c = 0; c < chunks; ++c) {
+                const uint64_t off = c * s + r;
+                if (off < n) order.push_back(off);
+            }
+        }
+        return order;
+    }
+
+    // Reorders the packed rows in place so row i ends up at posOfDoc[i]
+    // (cycle-following; one extra row of memory instead of a second DB copy).
+    void PermuteRows(std::vector<uint64_t> &raw, const std::vector<uint64_t> &posOfDoc, uint64_t wordsPerRow) {
+        std::vector<uint64_t> dest = posOfDoc;
+        for (uint64_t i = 0; i < dest.size(); ++i) {
+            while (dest[i] != i) {
+                const uint64_t j = dest[i];
+                std::swap_ranges(raw.begin() + static_cast<std::ptrdiff_t>(i * wordsPerRow),
+                                 raw.begin() + static_cast<std::ptrdiff_t>((i + 1) * wordsPerRow),
+                                 raw.begin() + static_cast<std::ptrdiff_t>(j * wordsPerRow));
+                std::swap(dest[i], dest[j]);
+            }
+        }
+    }
+
+    // Per-document Stage One positions that deal every IVF list across Piano's
+    // chunks (lists in centroid order, then documents in no list).
+    std::vector<uint64_t> ChunkSpreadPositions(const std::unordered_map<uint64_t, std::vector<uint64_t>> &mapping,
+                                               uint64_t n) {
+        const std::vector<uint64_t> order = ChunkInterleave(n, PianoChunkSize(n));
+        std::vector<uint64_t> pos(n, UINT64_MAX);
+        uint64_t k = 0;
+        std::vector<uint64_t> centroidIds;
+        centroidIds.reserve(mapping.size());
+        for (const auto &kv: mapping) centroidIds.push_back(kv.first);
+        std::sort(centroidIds.begin(), centroidIds.end());
+        for (uint64_t c: centroidIds) {
+            for (uint64_t doc: mapping.at(c)) {
+                if (doc < n && pos[doc] == UINT64_MAX) pos[doc] = order[k++];
+            }
+        }
+        for (uint64_t doc = 0; doc < n; ++doc) {
+            if (pos[doc] == UINT64_MAX) pos[doc] = order[k++];
+        }
+        return pos;
+    }
+
+    // ------------------------------------------------- Cluster PIR 1 database --
+
+    // One PIR 1 entry per centroid list. Entry c holds the packed embeddings of
+    // the list's members (ids < dbSize) in list order, then zero padding up to the
+    // longest list, so every entry has the same size and reveals nothing about
+    // which list was fetched. The client already holds the lists, so slot s of
+    // entry c is known to be members[c][s]; no document ids are stored.
+    struct ClusterLayout {
+        uint64_t numClusters = 0;
+        uint64_t slots = 0;                             // members of the longest list
+        std::vector<std::vector<uint64_t>> members;    // per centroid, slot order
+    };
+
+    ClusterLayout BuildClusterLayout(const std::unordered_map<uint64_t, std::vector<uint64_t>> &mapping,
+                                     uint64_t dbSize) {
+        ClusterLayout layout;
+        for (const auto &[c, ids]: mapping) {
+            (void) ids;
+            layout.numClusters = std::max<uint64_t>(layout.numClusters, c + 1);
+        }
+        if (layout.numClusters == 0 || layout.numClusters > (1ULL << 24)) {
+            throw std::runtime_error("cluster PIR: centroid mapping has " + std::to_string(layout.numClusters) +
+                                     " lists; check the mapping file");
+        }
+        layout.members.resize(layout.numClusters);
+        std::vector<bool> placed(dbSize, false);
+        uint64_t placedCount = 0, duplicates = 0, totalSlots = 0;
+        for (const auto &[c, ids]: mapping) {
+            auto &m = layout.members[c];
+            for (uint64_t id: ids) {
+                if (id >= dbSize) continue;  // -1 padding, truncated or invalid ids
+                m.push_back(id);
+                if (placed[id]) {
+                    ++duplicates;
+                } else {
+                    placed[id] = true;
+                    ++placedCount;
+                }
+            }
+            layout.slots = std::max<uint64_t>(layout.slots, m.size());
+            totalSlots += m.size();
+        }
+        if (layout.slots == 0) {
+            throw std::runtime_error("cluster PIR: no centroid list contains a document below --db-size");
+        }
+        const double paddingFactor =
+                static_cast<double>(layout.numClusters * layout.slots) / std::max<double>(1.0, totalSlots);
+        std::cout << "Cluster PIR database: " << layout.numClusters << " entries x " << layout.slots
+                  << " slots (" << layout.slots * g_codec.EntryBytes() << " B per entry), padding factor "
+                  << paddingFactor << "x" << std::endl;
+        if (paddingFactor > 2.0) {
+            std::cerr << "warning: cluster entries are mostly zero padding (padding factor " << paddingFactor
+                      << "x); unequal list sizes make every entry as large as the longest list" << std::endl;
+        }
+        if (placedCount < dbSize) {
+            std::cerr << "warning: " << (dbSize - placedCount) << " of " << dbSize
+                      << " documents are in no centroid list and can never be retrieved" << std::endl;
+        }
+        if (duplicates > 0) {
+            std::cerr << "warning: " << duplicates << " documents appear in more than one centroid list"
+                      << std::endl;
+        }
+        return layout;
+    }
+
+    std::vector<uint64_t> BuildClusterDB(const ClusterLayout &layout, const std::vector<uint64_t> &docRaw) {
+        const uint64_t ew = g_codec.words;  // words per document in the chosen precision
+        const uint64_t entryWords = layout.slots * ew;
+        std::vector<uint64_t> raw(layout.numClusters * entryWords, 0);
+        for (uint64_t c = 0; c < layout.numClusters; ++c) {
+            const auto &m = layout.members[c];
+            for (uint64_t s = 0; s < m.size(); ++s) {
+                std::copy_n(docRaw.begin() + static_cast<std::ptrdiff_t>(m[s] * ew), ew,
+                            raw.begin() + static_cast<std::ptrdiff_t>(c * entryWords + s * ew));
+            }
+        }
+        return raw;
+    }
+
     // Raw little-endian float32 file, row-major, kEmbeddingDim floats per row.
     // Only the first dbSize rows are read, so a larger file costs no extra memory.
     PackedDB LoadEmbeddingRawDBFromBinary(const std::string &path, uint64_t dbSize) {
@@ -387,11 +691,17 @@ namespace {
     class BudgetedPianoPIR {
     public:
         // Construction builds the server-side database; it is timed as "server setup".
+        // budgetMult (H) scales Piano's query budget. realAccounting counts only
+        // queries that consume a hint (Piano's own count: dummy queries and cache
+        // hits are free) instead of every query issued. Issued accounting gives a
+        // data-independent refresh schedule; real accounting refreshes less often
+        // but its timing reveals how many queries were dummies or cache hits.
         BudgetedPianoPIR(std::string name, uint64_t dbSize, uint64_t entryBytes,
-                         std::vector<uint64_t> rawDB, uint64_t failProbLog2)
-                : name_(std::move(name)) {
+                         std::vector<uint64_t> rawDB, uint64_t failProbLog2,
+                         double budgetMult = 1.0, bool realAccounting = false)
+                : name_(std::move(name)), realAccounting_(realAccounting) {
             const auto start = Clock::now();
-            pir_ = std::make_unique<PianoPIR>(dbSize, entryBytes, std::move(rawDB), failProbLog2);
+            pir_ = std::make_unique<PianoPIR>(dbSize, entryBytes, std::move(rawDB), failProbLog2, budgetMult);
             serverSetupSeconds_ = SecondsSince(start);
             std::cout << name_ << " server setup time " << serverSetupSeconds_ << " s" << std::endl;
         }
@@ -411,18 +721,34 @@ namespace {
             if (!prepared_) {
                 throw std::logic_error(name_ + ": Query() called before Preprocess()");
             }
-            if (usedSinceRefresh_ >= maxQueryNum_) {
+            const uint64_t used = realAccounting_ ? pir_->client_FinishedQueryNum() : usedSinceRefresh_;
+            if (used >= maxQueryNum_) {
                 Refresh("total query budget reached");
             } else if (realQuery && chunkUsed_[ChunkOf(idx)] >= maxPerChunk_) {
+                // Avoids Piano's "too many queries in chunk" error, but the timing of
+                // this refresh depends on which documents were queried; counted
+                // separately so experiments show whether it ever happens.
+                ++chunkRefreshCount_;
+                std::cerr << "warning: " << name_ << " refreshing early because chunk " << ChunkOf(idx)
+                          << " ran out of backup hints; this refresh's timing depends on the queried documents"
+                          << std::endl;
                 Refresh("per-chunk budget reached for chunk " + std::to_string(ChunkOf(idx)));
             }
+            const uint64_t finishedBefore = pir_->client_FinishedQueryNum();
             std::vector<uint64_t> result = pir_->Query(idx, realQuery);
+            const uint64_t consumed = pir_->client_FinishedQueryNum() - finishedBefore;  // 0: dummy or cache hit
             ++usedSinceRefresh_;
             onlineUploadBytes_ += pir_->UploadCostPerQuery();
             onlineDownloadBytes_ += pir_->DownloadCostPerQuery();
+            // Each budget unit used is charged 1/Q of the N*B restream that buys the
+            // budget, so the cost shows even if no refresh happens yet.
+            const double charged = realAccounting_ ? static_cast<double>(consumed) : 1.0;
+            amortizedRestreamBytes_ += charged * OfflineBytesPerPreprocessing() / static_cast<double>(maxQueryNum_);
             if (realQuery) {
-                ++chunkUsed_[ChunkOf(idx)];
+                // Per-chunk use always follows Piano's own count (cache hits use no backup).
+                if (consumed > 0) ++chunkUsed_[ChunkOf(idx)];
                 ++realIssued_;
+                if (consumed == 0) ++cacheHits_;
             } else {
                 ++dummyIssued_;
             }
@@ -440,11 +766,12 @@ namespace {
         struct Totals {
             double onlineUploadBytes = 0, onlineDownloadBytes = 0, refreshOfflineBytes = 0, refreshSeconds = 0;
             uint64_t queries = 0, refreshes = 0;
+            double amortizedRestreamBytes = 0;
         };
 
         Totals Snapshot() const {
             return {onlineUploadBytes_, onlineDownloadBytes_, refreshOfflineBytes_, refreshSeconds_,
-                    realIssued_ + dummyIssued_, refreshCount_};
+                    realIssued_ + dummyIssued_, refreshCount_, amortizedRestreamBytes_};
         }
 
         // Prints this PIR's online and refresh costs since `before`.
@@ -453,6 +780,8 @@ namespace {
             // Raw numbers kept on their own lines so existing log parsers still work.
             std::cout << label << " Upload " << std::llround(now.onlineUploadBytes - before.onlineUploadBytes) << std::endl;
             std::cout << label << " Download " << std::llround(now.onlineDownloadBytes - before.onlineDownloadBytes) << std::endl;
+            std::cout << label << " amortized restream "
+                      << std::llround(now.amortizedRestreamBytes - before.amortizedRestreamBytes) << std::endl;
             std::cout << label << " queries " << now.queries - before.queries << ", online "
                       << FormatBytes(now.onlineUploadBytes - before.onlineUploadBytes) << " up / "
                       << FormatBytes(now.onlineDownloadBytes - before.onlineDownloadBytes) << " down";
@@ -470,11 +799,16 @@ namespace {
                       << "  setup time:          server " << serverSetupSeconds_ << " s, client preprocessing "
                       << initialPrepSeconds_ << " s\n"
                       << "  queries:             " << realIssued_ << " real + " << dummyIssued_ << " dummy\n"
-                      << "  refreshes:           " << refreshCount_ << " (" << refreshSeconds_ << " s)\n"
+                      << "  refreshes:           " << refreshCount_ << " (" << refreshSeconds_ << " s), "
+                      << chunkRefreshCount_ << " triggered by one chunk running out\n"
+                      << "  budget accounting:   " << (realAccounting_ ? "real (hint-consuming queries only)" : "issued (every query)")
+                      << ", " << cacheHits_ << " cache hits\n"
                       << "  online upload:       " << FormatBytes(onlineUploadBytes_) << "\n"
                       << "  online download:     " << FormatBytes(onlineDownloadBytes_) << "\n"
                       << "  offline (initial):   " << FormatBytes(initialOfflineBytes_) << "\n"
                       << "  offline (refreshes): " << FormatBytes(refreshOfflineBytes_) << "\n"
+                      << "  amortized restream:  " << FormatBytes(amortizedRestreamBytes_) << " (budget used "
+                      << amortizedRestreamBytes_ / OfflineBytesPerPreprocessing() << " preprocessings)\n"
                       << "  total communication: "
                       << FormatBytes(onlineUploadBytes_ + onlineDownloadBytes_ + offlineTotal) << "\n"
                       << "  client storage:      "
@@ -569,6 +903,10 @@ namespace {
         double refreshOfflineBytes_ = 0.0;
         double onlineUploadBytes_ = 0.0;
         double onlineDownloadBytes_ = 0.0;
+        double amortizedRestreamBytes_ = 0.0;
+        bool realAccounting_ = false;
+        uint64_t chunkRefreshCount_ = 0;
+        uint64_t cacheHits_ = 0;
         uint64_t realIssued_ = 0;
         uint64_t dummyIssued_ = 0;
     };
@@ -603,7 +941,7 @@ namespace {
         const uint32_t slots = s.cc->GetRingDimension() / 2;
         if (slots < static_cast<uint32_t>(kSlotsUsed)) {
             throw std::runtime_error("CKKS context has " + std::to_string(slots) + " slots but the centroid "
-                                                                                   "packing needs " + std::to_string(kSlotsUsed) +
+                                     "packing needs " + std::to_string(kSlotsUsed) +
                                      " (ring dimension >= " + std::to_string(2 * kSlotsUsed) + ")");
         }
 
@@ -828,22 +1166,43 @@ namespace {
         const unsigned hw = std::thread::hardware_concurrency();
         const int numThreads = GetPositiveIntOpt(opts, "--threads", hw > 0 ? static_cast<int>(hw) : 1);
         const bool printDocs = GetBoolOpt(opts, "--print-docs", false);
+        // --budget-mult H: Stage One query budget per preprocessing is H * sqrt(n) * ln n.
+        const double budgetMult = std::stod(GetOpt(opts, "--budget-mult", "1"));
+        if (!(budgetMult > 0.0)) {
+            throw std::invalid_argument("--budget-mult must be positive");
+        }
+        // --budget-accounting issued|real (see BudgetedPianoPIR).
+        const std::string accountingMode = GetOpt(opts, "--budget-accounting", "issued");
+        if (accountingMode != "issued" && accountingMode != "real") {
+            throw std::invalid_argument("--budget-accounting must be issued or real");
+        }
+        const bool realAccounting = accountingMode == "real";
+        // --embedding-precision fp32|fp16|int8: Stage One entry format (fp32 = 3,072 B).
+        const std::string precision = GetOpt(opts, "--embedding-precision", "fp32");
+        g_codec = EmbeddingCodec::Make(precision);
+        // --chunk-spread: lay each IVF list across Piano's chunks (see ChunkInterleave).
+        const bool chunkSpread = GetBoolOpt(opts, "--chunk-spread", false);
+        // --cluster-pir: one PIR 1 entry per centroid list instead of per document.
+        const bool clusterPir = GetBoolOpt(opts, "--cluster-pir", false);
 
         const std::string embeddingDbPath = GetOpt(opts, "--embedding-db", mac
-                                                                           ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/faiss.json"
-                                                                           : "/home/ajanusze/PIANO-RAG/faiss.json");
+                ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/faiss.json"
+                : "/home/ajanusze/PIANO-RAG/faiss.json");
         // Optional raw float32 file (dbSize x 768). Avoids the JSON parse entirely.
         const std::string embeddingBinPath = GetOpt(opts, "--embedding-bin", "");
         const std::string centroidMappingPath = GetOpt(opts, "--centroid-mapping", mac
-                                                                                   ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/lists.json"
-                                                                                   : "../lists.json");
+                ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/prototype/data/lists.json"
+                : "../lists.json");
         const std::string textDbPath = GetOpt(opts, "--text-db", mac
-                                                                 ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index.txt"
-                                                                 : "/home/ajanusze/PIANO-RAG/uniform_index_1024.txt");
+                ? "/Users/antoniajanuszewicz/PycharmProjects/PIANO-RAG/uniform_index.txt"
+                : "/home/ajanusze/PIANO-RAG/uniform_index_1024.txt");
 
         std::cout << "Config: db-size " << dbSize << ", queries " << queryPaths.size() << ", top-k " << topK
                   << ", centroid-top-k " << centroidTopK << ", threads " << numThreads
                   << ", work-dir " << workDir << (mac ? ", local centroid path" : ", server centroid path")
+                  << (clusterPir ? ", PIR 1 cluster entries (one per centroid list)" : "")
+                  << ", budget multiplier " << budgetMult << ", budget accounting " << accountingMode
+                  << ", embedding precision " << precision << ", chunk spread " << (chunkSpread ? "on" : "off")
                   << std::endl;
 
         // ------------------------------------------------ One-time setup --
@@ -872,11 +1231,63 @@ namespace {
         std::cout << "Database for this run: " << dbSize << " of " << sourceEntries << " entries" << std::endl;
         ReportMappingCoverage(centroidToIndex, dbSize, sourceEntries);
 
+        // Stage One entry format (--embedding-precision).
+        if (g_codec.name != "fp32") {
+            const auto encStart = Clock::now();
+            embeddingDb.raw = g_codec.Encode(std::move(embeddingDb.raw), dbSize);
+            std::cout << "Stage One entries: " << g_codec.name << ", " << g_codec.EntryBytes() << " B per entry (encoded in "
+                      << SecondsSince(encStart) << " s)" << std::endl;
+        }
+
+        // --chunk-spread: per-document Stage One positions that spread every list
+        // over Piano's chunks. Empty means document id == position.
+        std::vector<uint64_t> pir1PosOfDoc;
+        if (chunkSpread && !clusterPir) {
+            const auto t0 = Clock::now();
+            pir1PosOfDoc = ChunkSpreadPositions(centroidToIndex, dbSize);
+            PermuteRows(embeddingDb.raw, pir1PosOfDoc, g_codec.words);
+            std::cout << "Stage One layout: lists spread over " << (dbSize + PianoChunkSize(dbSize) - 1) / PianoChunkSize(dbSize)
+                      << " Piano chunks of " << PianoChunkSize(dbSize) << " in " << SecondsSince(t0) << " s" << std::endl;
+        }
+
+        // --chunk-spread also lays the Stage Two text database out across its chunks,
+        // since the final top-k documents come from the same few lists.
+        std::vector<uint64_t> textPosOfDoc;
+        if (chunkSpread) {
+            textPosOfDoc = ChunkSpreadPositions(centroidToIndex, dbSize);
+            PermuteRows(textDb.raw, textPosOfDoc, kTextWords);
+        }
+
+        // PIR 1 database: per document, or (--cluster-pir) one entry per centroid list.
+        ClusterLayout clusterLayout;
+        std::vector<uint64_t> clusterEntryPos;  // --chunk-spread with --cluster-pir: list id -> entry position
+        uint64_t pir1Entries = dbSize, pir1EntryBytes = g_codec.EntryBytes();
+        std::vector<uint64_t> pir1Raw;
+        if (clusterPir) {
+            clusterLayout = BuildClusterLayout(centroidToIndex, dbSize);
+            pir1Raw = BuildClusterDB(clusterLayout, embeddingDb.raw);
+            std::vector<uint64_t>().swap(embeddingDb.raw);  // the per-document copy is no longer needed
+            pir1Entries = clusterLayout.numClusters;
+            pir1EntryBytes = clusterLayout.slots * g_codec.EntryBytes();
+            if (chunkSpread) {
+                // Neighbouring list ids go to different chunks, in case the lists a
+                // query probes have nearby ids.
+                clusterEntryPos = ChunkInterleave(pir1Entries, PianoChunkSize(pir1Entries));
+                PermuteRows(pir1Raw, clusterEntryPos, pir1EntryBytes / 8);
+                std::cout << "Stage One layout: list entries spread over Piano chunks of "
+                          << PianoChunkSize(pir1Entries) << std::endl;
+            }
+        } else {
+            pir1Raw = std::move(embeddingDb.raw);
+        }
+
         std::cout << "Server and Client One-time Setup" << std::endl;
         // Moved in: the only full copy of each DB now lives inside PianoPIR.
-        BudgetedPianoPIR embeddingPir("PIR 1 (embeddings)", dbSize, kEmbeddingEntryBytes,
-                                      std::move(embeddingDb.raw), failProbLog2);
-        BudgetedPianoPIR textPir("PIR 2 (text)", dbSize, kTextEntryBytes, std::move(textDb.raw), failProbLog2);
+        BudgetedPianoPIR embeddingPir(clusterPir ? "PIR 1 (cluster embeddings)" : "PIR 1 (embeddings)",
+                                      pir1Entries, pir1EntryBytes, std::move(pir1Raw), failProbLog2,
+                                      budgetMult, realAccounting);
+        BudgetedPianoPIR textPir("PIR 2 (text)", dbSize, kTextEntryBytes, std::move(textDb.raw), failProbLog2,
+                                 1.0, realAccounting);
         std::cout << "Server Setup time: " << embeddingPir.ServerSetupSeconds() + textPir.ServerSetupSeconds()
                   << std::endl;
 
@@ -935,57 +1346,110 @@ namespace {
             const double centroidSec = SecondsSince(t);
             std::cout << "Centroid time " << centroidSec << std::endl;
 
-            // Step 2: centroids -> candidate ids. Padding (-1 arrives as 2^64-1),
-            // ids truncated away by --db-size, out-of-range and duplicate ids
-            // become dummy PIR queries, so the number of queries the server sees
-            // stays centroidTopK x list size.
             std::cout << "Loading centroid indices ... " << std::endl;
             const std::vector<uint64_t> centroidIndices = load_centroid_indices(outputJson);
-            std::vector<uint64_t> candidates;
-            uint64_t paddingIds = 0, truncatedIds = 0, invalidIds = 0, duplicateIds = 0;
-            {
-                std::unordered_set<uint64_t> seen;
-                for (uint64_t idx: CentroidToIndex(centroidIndices, centroidToIndex)) {
-                    if (idx == kPaddingId) {
-                        ++paddingIds;
-                    } else if (idx >= sourceEntries) {
-                        ++invalidIds;
-                    } else if (idx >= dbSize) {
-                        ++truncatedIds;  // exists in the files, excluded by --db-size
-                    } else if (!seen.insert(idx).second) {
-                        ++duplicateIds;
-                    } else {
-                        candidates.push_back(idx);
+            std::vector<std::vector<float>> responses;
+            std::vector<uint64_t> responseIds;  // original document id of each response
+
+            if (clusterPir) {
+                // Steps 2-3, cluster mode: one PIR 1 query per selected centroid, each
+                // returning that centroid's whole list. Unknown or repeated centroids
+                // become dummy queries, so the server always sees centroid-top-k queries.
+                std::vector<uint64_t> clusterQueries;
+                uint64_t clusterDummies = 0;
+                {
+                    std::unordered_set<uint64_t> seen;
+                    for (uint64_t c: centroidIndices) {
+                        if (c < clusterLayout.numClusters && seen.insert(c).second) {
+                            clusterQueries.push_back(c);
+                        } else {
+                            ++clusterDummies;
+                        }
                     }
                 }
-            }
-            const uint64_t dummySlots = paddingIds + truncatedIds + invalidIds + duplicateIds;
-            if (dummySlots > 0) {
-                std::cout << "Replacing " << dummySlots << " ids with dummy PIR queries (" << paddingIds
-                          << " padding, " << truncatedIds << " beyond --db-size, " << invalidIds
-                          << " beyond the database files, " << duplicateIds << " duplicate)" << std::endl;
-            }
-            std::cout << "Queries to batch : ";
-            for (uint64_t idx: candidates) std::cout << idx << " ";
-            std::cout << std::endl;
+                if (clusterDummies > 0) {
+                    std::cout << "Replacing " << clusterDummies
+                              << " unknown or duplicate centroid ids with dummy PIR queries" << std::endl;
+                }
+                std::cout << "Queries to batch : ";
+                for (uint64_t c: clusterQueries) {
+                    for (uint64_t id: clusterLayout.members[c]) std::cout << id << " ";
+                }
+                std::cout << std::endl;
 
-            // Step 3: PIR 1, every candidate retrieved (refreshing if needed).
-            t = Clock::now();
-            std::cout << "Processing queries ... " << candidates.size() << std::endl;
-            std::vector<std::vector<float>> responses;
-            responses.reserve(candidates.size());
-            for (uint64_t idx: candidates) {
-                responses.push_back(UnpackEmbeddingRow(embeddingPir.Query(idx, /*realQuery=*/true)));
-            }
-            for (uint64_t d = 0; d < dummySlots; ++d) {
-                embeddingPir.Query(0, /*realQuery=*/false);
+                t = Clock::now();
+                std::cout << "Processing cluster queries ... " << clusterQueries.size() << std::endl;
+                for (uint64_t c: clusterQueries) {
+                    const uint64_t entryPos = clusterEntryPos.empty() ? c : clusterEntryPos[c];
+                    const std::vector<uint64_t> entry = embeddingPir.Query(entryPos, /*realQuery=*/true);
+                    const auto &members = clusterLayout.members[c];
+                    if (entry.size() < members.size() * g_codec.words) {
+                        throw std::runtime_error("cluster PIR: entry for centroid " + std::to_string(c) +
+                                                 " has " + std::to_string(entry.size()) + " words, expected at least " +
+                                                 std::to_string(members.size() * g_codec.words));
+                    }
+                    for (uint64_t s = 0; s < members.size(); ++s) {
+                        responses.push_back(g_codec.Decode(entry.data() + s * g_codec.words));
+                        responseIds.push_back(members[s]);
+                    }
+                }
+                for (uint64_t d = 0; d < clusterDummies; ++d) {
+                    embeddingPir.Query(0, /*realQuery=*/false);
+                }
+                std::cout << "PIR 1 cluster: " << clusterQueries.size() << " clusters fetched, " << clusterDummies
+                          << " dummy, " << responses.size() << " candidates" << std::endl;
+            } else {
+                // Step 2: centroids -> candidate ids. Padding (-1 arrives as 2^64-1),
+                // ids truncated away by --db-size, out-of-range and duplicate ids
+                // become dummy PIR queries, so the number of queries the server sees
+                // stays centroidTopK x list size.
+                std::vector<uint64_t> candidates;
+                uint64_t paddingIds = 0, truncatedIds = 0, invalidIds = 0, duplicateIds = 0;
+                {
+                    std::unordered_set<uint64_t> seen;
+                    for (uint64_t idx: CentroidToIndex(centroidIndices, centroidToIndex)) {
+                        if (idx == kPaddingId) {
+                            ++paddingIds;
+                        } else if (idx >= sourceEntries) {
+                            ++invalidIds;
+                        } else if (idx >= dbSize) {
+                            ++truncatedIds;  // exists in the files, excluded by --db-size
+                        } else if (!seen.insert(idx).second) {
+                            ++duplicateIds;
+                        } else {
+                            candidates.push_back(idx);
+                        }
+                    }
+                }
+                const uint64_t dummySlots = paddingIds + truncatedIds + invalidIds + duplicateIds;
+                if (dummySlots > 0) {
+                    std::cout << "Replacing " << dummySlots << " ids with dummy PIR queries (" << paddingIds
+                              << " padding, " << truncatedIds << " beyond --db-size, " << invalidIds
+                              << " beyond the database files, " << duplicateIds << " duplicate)" << std::endl;
+                }
+                std::cout << "Queries to batch : ";
+                for (uint64_t idx: candidates) std::cout << idx << " ";
+                std::cout << std::endl;
+
+                // Step 3: PIR 1, every candidate retrieved (refreshing if needed).
+                t = Clock::now();
+                std::cout << "Processing queries ... " << candidates.size() << std::endl;
+                responses.reserve(candidates.size());
+                for (uint64_t idx: candidates) {
+                    const uint64_t pos = pir1PosOfDoc.empty() ? idx : pir1PosOfDoc[idx];
+                    responses.push_back(g_codec.Decode(embeddingPir.Query(pos, /*realQuery=*/true)));
+                    responseIds.push_back(idx);
+                }
+                for (uint64_t d = 0; d < dummySlots; ++d) {
+                    embeddingPir.Query(0, /*realQuery=*/false);
+                }
             }
             embeddingPir.PrintQueryCosts("PIR 1", pir1Before);
             std::cout << "PIR 1 time " << SecondsSince(t) << std::endl;
 
             // Step 4: local re-rank.
             std::cout << "Computing global distances " << std::endl;
-            const auto results = FaissTopK(responses, candidates, inputVectorPath, topK);
+            const auto results = FaissTopK(responses, responseIds, inputVectorPath, topK);
             if (results.empty()) {
                 ++queriesWithNoResults;
             }
@@ -1001,7 +1465,8 @@ namespace {
             std::vector<std::string> retrievedDocs;
             retrievedDocs.reserve(results.size());
             for (const auto &r: results) {
-                retrievedDocs.push_back(UnpackTextEntry(textPir.Query(r.first, /*realQuery=*/true)));
+                const uint64_t textPos = textPosOfDoc.empty() ? r.first : textPosOfDoc[r.first];
+                retrievedDocs.push_back(UnpackTextEntry(textPir.Query(textPos, /*realQuery=*/true)));
                 if (printDocs) {
                     std::cout << "[" << r.first << "] " << retrievedDocs.back() << std::endl;
                 }
